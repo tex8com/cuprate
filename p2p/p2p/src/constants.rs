@@ -55,7 +55,7 @@ pub(crate) const INITIAL_CHAIN_SEARCH_TIMEOUT: Duration = Duration::from_secs(5)
 /// The enforced maximum amount of blocks to request in a batch.
 ///
 /// Requesting more than this will cause the peer to disconnect and potentially lead to bans.
-pub const MAX_BLOCK_BATCH_LEN: usize = 100;
+pub const MAX_BLOCK_BATCH_LEN: usize = 1000; // was: 100
 
 /// The timeout that the block downloader will use for requests.
 pub(crate) const BLOCK_DOWNLOADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

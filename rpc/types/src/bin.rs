@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use cuprate_epee_encoding::container_as_blob::ContainerAsBlob;
 
 use cuprate_types::{
-    rpc::{BlockOutputIndices, PoolInfo},
+    rpc::{BlockOutputIndices, PoolTxInfo},
     BlockCompleteEntry,
 };
 
@@ -123,8 +123,9 @@ define_request_and_response! {
         block_ids: ByteArrayVec<32> = default::<ByteArrayVec<32>>(), "default",
         start_height: u64,
         prune: bool,
-        no_miner_tx: bool,
+        no_miner_tx: bool = default::<bool>(), "default",
         pool_info_since: u64 = default::<u64>(), "default",
+        max_block_count: u64 = default::<u64>(), "default",
     },
 
     // TODO: add `top_block_hash` field
@@ -135,7 +136,10 @@ define_request_and_response! {
         current_height: u64,
         output_indices: Vec<BlockOutputIndices> = default::<Vec<BlockOutputIndices>>(), "default",
         daemon_time: u64 = default::<u64>(), "default",
-        pool_info: PoolInfo = default::<PoolInfo>(), "default",
+        pool_info_extent: u8 = default::<u8>(), "default",
+        added_pool_txs: Vec<PoolTxInfo> = default::<Vec<PoolTxInfo>>(), "default",
+        remaining_added_pool_txids: ByteArrayVec<32> = default::<ByteArrayVec<32>>(), "default",
+        removed_pool_txids: ByteArrayVec<32> = default::<ByteArrayVec<32>>(), "default",
     }
 }
 

@@ -7,9 +7,10 @@
 use std::num::NonZero;
 
 use anyhow::{anyhow, Error};
-use bytes::Bytes;
-
-use cuprate_constants::rpc::{RESTRICTED_BLOCK_COUNT, RESTRICTED_TRANSACTIONS_COUNT};
+use cuprate_constants::rpc::{
+    GET_BLOCKS_BIN_MAX_BLOCK_COUNT, GET_BLOCKS_BIN_MAX_TX_COUNT, RESTRICTED_BLOCK_COUNT,
+    RESTRICTED_TRANSACTIONS_COUNT,
+};
 use cuprate_fixed_bytes::ByteArrayVec;
 use cuprate_helper::cast::{u64_to_usize, usize_to_u64};
 use cuprate_rpc_interface::RpcHandler;
@@ -25,15 +26,19 @@ use cuprate_rpc_types::{
     misc::RequestedInfo,
 };
 use cuprate_types::{
-    rpc::{PoolInfo, PoolInfoExtent},
-    BlockCompleteEntry,
+    rpc::{BlockOutputIndices, PoolInfo, PoolInfoExtent, TxOutputIndices},
+    BlockCompleteEntry, TransactionBlobs,
 };
+use monero_oxide::block::Block;
 
 use crate::rpc::{
     handlers::{helper, shared, shared::not_available},
     service::{blockchain, txpool},
     CupratedRpcHandler,
 };
+
+const GET_BLOCKS_BIN_MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+const GET_BLOCKS_BIN_FETCH_BATCH: usize = 128;
 
 /// Map a [`BinRequest`] to the function that will lead to a [`BinResponse`].
 pub async fn map_request(
@@ -44,13 +49,17 @@ pub async fn map_request(
     use BinResponse as Resp;
 
     Ok(match request {
-        Req::GetBlocks(r) => Resp::GetBlocks(not_available()?),
-        Req::GetBlocksByHeight(r) => Resp::GetBlocksByHeight(not_available()?),
-        Req::GetHashes(r) => Resp::GetHashes(not_available()?),
-        Req::GetOutputIndexes(r) => Resp::GetOutputIndexes(not_available()?),
-        Req::GetOuts(r) => Resp::GetOuts(not_available()?),
-        Req::GetTransactionPoolHashes(r) => Resp::GetTransactionPoolHashes(not_available()?),
-        Req::GetOutputDistribution(r) => Resp::GetOutputDistribution(not_available()?),
+        Req::GetBlocks(r) => Resp::GetBlocks(get_blocks(state, r).await?),
+        Req::GetBlocksByHeight(r) => Resp::GetBlocksByHeight(get_blocks_by_height(state, r).await?),
+        Req::GetHashes(r) => Resp::GetHashes(get_hashes(state, r).await?),
+        Req::GetOutputIndexes(r) => Resp::GetOutputIndexes(get_output_indexes(state, r).await?),
+        Req::GetOuts(r) => Resp::GetOuts(get_outs(state, r).await?),
+        Req::GetTransactionPoolHashes(r) => {
+            Resp::GetTransactionPoolHashes(get_transaction_pool_hashes(state, r).await?)
+        }
+        Req::GetOutputDistribution(r) => {
+            Resp::GetOutputDistribution(get_output_distribution(state, r).await?)
+        }
     })
 }
 
@@ -70,6 +79,7 @@ async fn get_blocks(
         prune,
         no_miner_tx,
         pool_info_since,
+        max_block_count,
     } = request;
 
     let block_hashes: Vec<[u8; 32]> = (&block_ids).into();
@@ -85,8 +95,6 @@ async fn get_blocks(
         RequestedInfo::PoolOnly => (false, true),
     };
 
-    let pool_info_extent = PoolInfoExtent::None;
-
     let pool_info = if get_pool {
         let is_restricted = state.is_restricted();
         let include_sensitive_txs = !is_restricted;
@@ -101,12 +109,15 @@ async fn get_blocks(
             &mut state.txpool_read,
             include_sensitive_txs,
             max_tx_count,
-            NonZero::new(u64_to_usize(request.pool_info_since)),
+            NonZero::new(u64_to_usize(pool_info_since)),
         )
         .await?
     } else {
         PoolInfo::None
     };
+
+    let (pool_info_extent, added_pool_txs, remaining_added_pool_txids, removed_pool_txids) =
+        split_pool_info(pool_info);
 
     let resp = GetBlocksResponse {
         base: helper::access_response_base(false),
@@ -115,7 +126,10 @@ async fn get_blocks(
         current_height: 0,
         output_indices: vec![],
         daemon_time,
-        pool_info,
+        pool_info_extent,
+        added_pool_txs,
+        remaining_added_pool_txids,
+        removed_pool_txids,
     };
 
     if !get_blocks {
@@ -133,26 +147,170 @@ async fn get_blocks(
         }
     }
 
-    let (block_hashes, start_height, _) =
-        blockchain::next_chain_entry(&mut state.blockchain_read, block_hashes, start_height)
-            .await?;
+    let max_blocks = if max_block_count == 0 {
+        GET_BLOCKS_BIN_MAX_BLOCK_COUNT
+    } else {
+        max_block_count.min(GET_BLOCKS_BIN_MAX_BLOCK_COUNT)
+    };
 
-    if start_height.is_none() {
+    let (_, first_known_height, chain_height) =
+        blockchain::next_chain_entry(&mut state.blockchain_read, block_hashes, 1).await?;
+
+    let Some(first_known_height) = first_known_height else {
         return Err(anyhow!("Block IDs were not sorted properly"));
-    }
+    };
 
-    let (blocks, missing_hashes, height) =
-        blockchain::block_complete_entries(&mut state.blockchain_read, block_hashes).await?;
+    let response_start_height = if start_height > 0 {
+        u64_to_usize(start_height)
+    } else {
+        first_known_height
+    };
 
-    if !missing_hashes.is_empty() {
-        return Err(anyhow!("Missing blocks"));
-    }
+    let block_count = chain_height
+        .saturating_sub(response_start_height)
+        .min(u64_to_usize(max_blocks));
+
+    let blocks =
+        capped_block_complete_entries(&mut state, response_start_height, chain_height, block_count)
+            .await?;
+    let output_indices = output_indices_for_blocks(&mut state, &blocks, no_miner_tx).await?;
 
     Ok(GetBlocksResponse {
         blocks,
-        current_height: usize_to_u64(height),
+        start_height: usize_to_u64(response_start_height),
+        current_height: usize_to_u64(chain_height),
+        output_indices,
         ..resp
     })
+}
+
+fn split_pool_info(
+    pool_info: PoolInfo,
+) -> (
+    u8,
+    Vec<cuprate_types::rpc::PoolTxInfo>,
+    ByteArrayVec<32>,
+    ByteArrayVec<32>,
+) {
+    match pool_info {
+        PoolInfo::None => (
+            PoolInfoExtent::None.to_u8(),
+            vec![],
+            ByteArrayVec::default(),
+            ByteArrayVec::default(),
+        ),
+        PoolInfo::Incremental(pool_info) => (
+            PoolInfoExtent::Incremental.to_u8(),
+            pool_info.added_pool_txs,
+            pool_info.remaining_added_pool_txids,
+            pool_info.removed_pool_txids,
+        ),
+        PoolInfo::Full(pool_info) => (
+            PoolInfoExtent::Full.to_u8(),
+            pool_info.added_pool_txs,
+            pool_info.remaining_added_pool_txids,
+            ByteArrayVec::default(),
+        ),
+    }
+}
+
+async fn capped_block_complete_entries(
+    state: &mut CupratedRpcHandler,
+    response_start_height: usize,
+    chain_height: usize,
+    block_count: usize,
+) -> Result<Vec<BlockCompleteEntry>, Error> {
+    let mut blocks = Vec::new();
+    let mut response_bytes = 0_usize;
+    let mut tx_count = 0_usize;
+    let mut next_height = response_start_height;
+    let end_height = response_start_height
+        .saturating_add(block_count)
+        .min(chain_height);
+    let max_tx_count = u64_to_usize(GET_BLOCKS_BIN_MAX_TX_COUNT);
+
+    while next_height < end_height {
+        let batch_end = next_height
+            .saturating_add(GET_BLOCKS_BIN_FETCH_BATCH)
+            .min(end_height);
+        let heights = (next_height..batch_end).map(usize_to_u64).collect();
+        let batch =
+            blockchain::block_complete_entries_by_height(&mut state.blockchain_read, heights)
+                .await?;
+
+        for block in batch {
+            let block_response_bytes = block_response_bytes(&block);
+            let block_tx_count = block.txs.len();
+
+            if !blocks.is_empty()
+                && (response_bytes.saturating_add(block_response_bytes)
+                    > GET_BLOCKS_BIN_MAX_RESPONSE_BYTES
+                    || tx_count.saturating_add(block_tx_count) > max_tx_count)
+            {
+                return Ok(blocks);
+            }
+
+            response_bytes = response_bytes.saturating_add(block_response_bytes);
+            tx_count = tx_count.saturating_add(block_tx_count);
+            blocks.push(block);
+        }
+
+        next_height = batch_end;
+    }
+
+    Ok(blocks)
+}
+
+fn block_response_bytes(block: &BlockCompleteEntry) -> usize {
+    let tx_bytes = match &block.txs {
+        TransactionBlobs::Pruned(txs) => txs
+            .iter()
+            .map(|tx| tx.blob.len().saturating_add(32))
+            .sum::<usize>(),
+        TransactionBlobs::Normal(txs) => txs.iter().map(bytes::Bytes::len).sum::<usize>(),
+        TransactionBlobs::None => 0,
+    };
+
+    block
+        .block
+        .len()
+        .saturating_add(tx_bytes)
+        .saturating_add(256)
+}
+
+async fn output_indices_for_blocks(
+    state: &mut CupratedRpcHandler,
+    blocks: &[BlockCompleteEntry],
+    no_miner_tx: bool,
+) -> Result<Vec<BlockOutputIndices>, Error> {
+    let mut output_indices = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        let parsed_block = Block::read(&mut block.block.as_ref())?;
+        let mut indices = Vec::with_capacity(parsed_block.transactions.len() + 1);
+
+        if no_miner_tx {
+            indices.push(TxOutputIndices { indices: vec![] });
+        } else {
+            indices.push(TxOutputIndices {
+                indices: blockchain::tx_output_indexes(
+                    &mut state.blockchain_read,
+                    parsed_block.miner_transaction().hash(),
+                )
+                .await?,
+            });
+        }
+
+        for tx_hash in parsed_block.transactions {
+            indices.push(TxOutputIndices {
+                indices: blockchain::tx_output_indexes(&mut state.blockchain_read, tx_hash).await?,
+            });
+        }
+
+        output_indices.push(BlockOutputIndices { indices });
+    }
+
+    Ok(output_indices)
 }
 
 /// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L817-L857>
@@ -197,14 +355,20 @@ async fn get_hashes(
 
     let hashes: Vec<[u8; 32]> = (&block_ids).into();
 
-    let (m_blocks_ids, _, current_height) =
-        blockchain::next_chain_entry(&mut state.blockchain_read, hashes, start_height).await?;
+    let (m_blocks_ids, first_known_height, current_height) = blockchain::next_chain_entry(
+        &mut state.blockchain_read,
+        hashes,
+        GET_BLOCKS_BIN_MAX_BLOCK_COUNT,
+    )
+    .await?;
+    let first_known_height =
+        first_known_height.ok_or_else(|| anyhow!("Block IDs were not sorted properly"))?;
 
     Ok(GetHashesResponse {
         base: helper::access_response_base(false),
         m_blocks_ids: m_blocks_ids.into(),
         current_height: usize_to_u64(current_height),
-        start_height,
+        start_height: usize_to_u64(first_known_height),
     })
 }
 

@@ -914,14 +914,16 @@ fn block_by_hash(env: &ConcreteEnv, block_hash: BlockHash) -> ResponseResult {
 
 /// [`BlockchainReadRequest::TotalTxCount`]
 fn total_tx_count(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::TotalTxCount(todo!()))
+    Ok(BlockchainResponse::TotalTxCount(0))
 }
 
 /// [`BlockchainReadRequest::DatabaseSize`]
 fn database_size(env: &ConcreteEnv) -> ResponseResult {
+    use cuprate_database::Env;
+    let db_size = env.disk_size_bytes().unwrap_or(0);
     Ok(BlockchainResponse::DatabaseSize {
-        database_size: todo!(),
-        free_space: todo!(),
+        database_size: db_size,
+        free_space: 0,
     })
 }
 
@@ -942,7 +944,7 @@ fn alt_chains(env: &ConcreteEnv) -> ResponseResult {
 
 /// [`BlockchainReadRequest::AltChainCount`]
 fn alt_chain_count(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::AltChainCount(todo!()))
+    Ok(BlockchainResponse::AltChainCount(0))
 }
 
 /// [`BlockchainReadRequest::Transactions`]

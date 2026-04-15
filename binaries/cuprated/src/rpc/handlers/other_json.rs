@@ -73,18 +73,22 @@ pub async fn map_request(
 
     Ok(match request {
         Req::GetHeight(r) => Resp::GetHeight(get_height(state, r).await?),
-        Req::GetTransactions(r) => Resp::GetTransactions(not_available()?),
+        Req::GetTransactions(r) => Resp::GetTransactions(get_transactions(state, r).await?),
         Req::GetAltBlocksHashes(r) => Resp::GetAltBlocksHashes(not_available()?),
-        Req::IsKeyImageSpent(r) => Resp::IsKeyImageSpent(not_available()?),
+        Req::IsKeyImageSpent(r) => Resp::IsKeyImageSpent(is_key_image_spent(state, r).await?),
         Req::SendRawTransaction(r) => {
             Resp::SendRawTransaction(send_raw_transaction(state, r).await?)
         }
         Req::SaveBc(r) => Resp::SaveBc(not_available()?),
-        Req::GetPeerList(r) => Resp::GetPeerList(not_available()?),
+        Req::GetPeerList(r) => Resp::GetPeerList(get_peer_list(state, r).await?),
         Req::SetLogLevel(r) => Resp::SetLogLevel(not_available()?),
         Req::SetLogCategories(r) => Resp::SetLogCategories(not_available()?),
-        Req::GetTransactionPool(r) => Resp::GetTransactionPool(not_available()?),
-        Req::GetTransactionPoolStats(r) => Resp::GetTransactionPoolStats(not_available()?),
+        Req::GetTransactionPool(r) => {
+            Resp::GetTransactionPool(get_transaction_pool(state, r).await?)
+        }
+        Req::GetTransactionPoolStats(r) => {
+            Resp::GetTransactionPoolStats(get_transaction_pool_stats(state, r).await?)
+        }
         Req::StopDaemon(r) => Resp::StopDaemon(not_available()?),
         Req::GetLimit(r) => Resp::GetLimit(not_available()?),
         Req::SetLimit(r) => Resp::SetLimit(not_available()?),
@@ -331,16 +335,19 @@ async fn is_key_image_spent(
 
     // Check if the remaining unspent key images exist in the transaction pool.
     if !key_images.is_empty() {
-        txpool::key_images_spent_vec(&mut state.txpool_read, key_images, !restricted)
-            .await?
-            .into_iter()
-            .for_each(|ki| {
-                if ki {
-                    spent_status.push(KeyImageSpentStatus::SpentInPool);
-                } else {
-                    spent_status.push(KeyImageSpentStatus::Unspent);
+        let txpool_status =
+            txpool::key_images_spent_vec(&mut state.txpool_read, key_images, !restricted)
+                .await?
+                .into_iter();
+
+        let mut txpool_status = txpool_status;
+        for status in &mut spent_status {
+            if matches!(status, KeyImageSpentStatus::Unspent) {
+                if txpool_status.next().unwrap_or(false) {
+                    *status = KeyImageSpentStatus::SpentInPool;
                 }
-            });
+            }
+        }
     }
 
     let spent_status = spent_status

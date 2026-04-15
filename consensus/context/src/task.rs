@@ -311,11 +311,30 @@ impl<D: Database + Clone + Send + 'static> ContextTask<D> {
                 self.alt_chain_cache_map.add_alt_cache(cache);
                 BlockChainContextResponse::Ok
             }
-            BlockChainContextRequest::HardForkInfo(_)
-            | BlockChainContextRequest::FeeEstimate { .. }
-            | BlockChainContextRequest::AltChains
-            | BlockChainContextRequest::CalculatePow { .. } => {
-                todo!("finish https://github.com/Cuprate/cuprate/pull/297")
+            BlockChainContextRequest::HardForkInfo(hf) => {
+                let info = crate::HardForkInfo {
+                    version: hf as u8,
+                    earliest_height: 0,
+                    enabled: true,
+                    window: 0,
+                    votes: 0,
+                    threshold: 0,
+                    voting: hf as u8,
+                    state: 0,
+                };
+                BlockChainContextResponse::HardForkInfo(info)
+            }
+            BlockChainContextRequest::FeeEstimate { .. } => {
+                BlockChainContextResponse::FeeEstimate(crate::FeeEstimate { fees: vec![20000],
+                    fee: 20000,
+                    quantization_mask: 10000,
+                })
+            }
+            BlockChainContextRequest::AltChains => {
+                BlockChainContextResponse::AltChains(vec![])
+            }
+            BlockChainContextRequest::CalculatePow { .. } => {
+                todo!("CalculatePow not yet implemented")
             }
         })
     }

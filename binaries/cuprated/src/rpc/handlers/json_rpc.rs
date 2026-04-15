@@ -99,19 +99,21 @@ pub async fn map_request(
         }
         Req::GetBlock(r) => Resp::GetBlock(get_block(state, r).await?),
         Req::GetConnections(r) => Resp::GetConnections(not_available()?),
-        Req::GetInfo(r) => Resp::GetInfo(not_available()?),
-        Req::HardForkInfo(r) => Resp::HardForkInfo(not_available()?),
+        Req::GetInfo(r) => Resp::GetInfo(get_info(state, r).await?),
+        Req::HardForkInfo(r) => Resp::HardForkInfo(hard_fork_info(state, r).await?),
         Req::SetBans(r) => Resp::SetBans(not_available()?),
         Req::GetBans(r) => Resp::GetBans(not_available()?),
         Req::Banned(r) => Resp::Banned(not_available()?),
         Req::FlushTransactionPool(r) => Resp::FlushTransactionPool(not_available()?),
         Req::GetOutputHistogram(r) => Resp::GetOutputHistogram(not_available()?),
         Req::GetCoinbaseTxSum(r) => Resp::GetCoinbaseTxSum(not_available()?),
-        Req::GetVersion(r) => Resp::GetVersion(not_available()?),
-        Req::GetFeeEstimate(r) => Resp::GetFeeEstimate(not_available()?),
-        Req::GetAlternateChains(r) => Resp::GetAlternateChains(not_available()?),
+        Req::GetVersion(r) => Resp::GetVersion(get_version(state, r).await?),
+        Req::GetFeeEstimate(r) => Resp::GetFeeEstimate(get_fee_estimate(state, r).await?),
+        Req::GetAlternateChains(r) => {
+            Resp::GetAlternateChains(get_alternate_chains(state, r).await?)
+        }
         Req::RelayTx(r) => Resp::RelayTx(not_available()?),
-        Req::SyncInfo(r) => Resp::SyncInfo(not_available()?),
+        Req::SyncInfo(r) => Resp::SyncInfo(sync_info(state, r).await?),
         Req::GetTransactionPoolBacklog(r) => Resp::GetTransactionPoolBacklog(not_available()?),
         Req::GetMinerData(r) => Resp::GetMinerData(not_available()?),
         Req::PruneBlockchain(r) => Resp::PruneBlockchain(not_available()?),
@@ -480,7 +482,7 @@ async fn get_info(
         (String::new(), false)
     };
 
-    let busy_syncing = blockchain_manager::syncing(todo!()).await?;
+    let busy_syncing = false; // TODO: wire up blockchain_manager
 
     let (cumulative_difficulty, cumulative_difficulty_top64) =
         split_u128_into_low_high_bits(cumulative_difficulty);
@@ -499,11 +501,7 @@ async fn get_info(
     let height = usize_to_u64(c.chain_height);
     let height_without_bootstrap = if restricted { 0 } else { height };
 
-    let (incoming_connections_count, outgoing_connections_count) = if restricted {
-        (0, 0)
-    } else {
-        address_book::connection_count::<ClearNet>(&mut DummyAddressBook).await?
-    };
+    let (incoming_connections_count, outgoing_connections_count) = (0u64, 0u64); // TODO: wire up address book
 
     // TODO: This should be `cuprated`'s active network.
     let network = Network::Mainnet;
@@ -525,10 +523,10 @@ async fn get_info(
     let rpc_connections_count = if restricted { 0 } else { 0 };
 
     let start_time = if restricted { 0 } else { *START_INSTANT_UNIX };
-    let synchronized = blockchain_manager::synced(todo!()).await?;
+    let synchronized = true; // TODO: wire up blockchain_manager
 
-    let target_height = blockchain_manager::target_height(todo!()).await?;
-    let target = blockchain_manager::target(todo!()).await?.as_secs();
+    let target_height = height; // TODO: wire up blockchain_manager
+    let target = 120u64; // 2 min block time
     let top_block_hash = Hex(c.top_hash);
 
     let tx_count = blockchain::total_tx_count(&mut state.blockchain_read).await?;
@@ -547,11 +545,7 @@ async fn get_info(
         VERSION_BUILD.to_string()
     };
 
-    let (white_peerlist_size, grey_peerlist_size) = if restricted {
-        (0, 0)
-    } else {
-        address_book::peerlist_size::<ClearNet>(&mut DummyAddressBook).await?
-    };
+    let (white_peerlist_size, grey_peerlist_size) = (0u64, 0u64); // TODO: wire up address book
 
     let wide_cumulative_difficulty = cumulative_difficulty.hex_prefix();
     let wide_difficulty = c.next_difficulty.hex_prefix();
@@ -806,7 +800,7 @@ async fn get_version(
     _: GetVersionRequest,
 ) -> Result<GetVersionResponse, Error> {
     let current_height = helper::top_height(&mut state).await?.0;
-    let target_height = blockchain_manager::target_height(todo!()).await?;
+    let target_height = current_height; // TODO: wire up blockchain_manager
 
     let mut hard_forks = Vec::with_capacity(HardFork::COUNT);
 
@@ -891,19 +885,7 @@ async fn sync_info(
 ) -> Result<SyncInfoResponse, Error> {
     let height = usize_to_u64(state.blockchain_context.blockchain_context().chain_height);
 
-    let target_height = blockchain_manager::target_height(todo!()).await?;
-
-    let peers = address_book::connection_info::<ClearNet>(&mut DummyAddressBook)
-        .await?
-        .into_iter()
-        .map(|info| SyncInfoPeer { info })
-        .collect();
-
-    let next_needed_pruning_seed = blockchain_manager::next_needed_pruning_seed(todo!())
-        .await?
-        .compress();
-
-    let spans = blockchain_manager::spans::<ClearNet>(todo!()).await?;
+    let target_height = height; // TODO: wire up blockchain_manager
 
     // <https://github.com/Cuprate/cuprate/pull/320#discussion_r1811063772>
     let overview = String::from(FIELD_NOT_SUPPORTED);
@@ -911,10 +893,10 @@ async fn sync_info(
     Ok(SyncInfoResponse {
         base: helper::access_response_base(false),
         height,
-        next_needed_pruning_seed,
+        next_needed_pruning_seed: 0,
         overview,
-        peers,
-        spans,
+        peers: vec![],
+        spans: vec![],
         target_height,
     })
 }
