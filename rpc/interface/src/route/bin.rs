@@ -32,9 +32,9 @@ macro_rules! generate_endpoints_with_input {
                 State(handler): State<H>,
                 mut request: Bytes,
             ) -> Result<Bytes, StatusCode> {
-                // Serialize into the request type.
+                eprintln!("[BIN RPC] {} called, request_body_size={}", stringify!($variant), request.len());
                 let request = BinRequest::$variant(
-                    from_bytes(&mut request).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    from_bytes(&mut request).map_err(|e| { eprintln!("BIN RPC deserialization error: {e:?}, remaining_bytes={}", request.len()); StatusCode::INTERNAL_SERVER_ERROR })?
                 );
 
                 generate_endpoints_inner!($variant, handler, request)
@@ -71,31 +71,26 @@ macro_rules! generate_endpoints_inner {
     ($variant:ident, $handler:ident, $request:expr_2021) => {
         paste::paste! {
             {
-                // Check if restricted.
-                //
-                // INVARIANT:
-                // The RPC handler functions in `cuprated` depend on this line existing,
-                // the functions themselves do not check if they are being called
-                // from an (un)restricted context. This line must be here or all
-                // methods will be allowed to be called freely.
                 if [<$variant Request>]::IS_RESTRICTED && $handler.is_restricted() {
-                    // TODO: mimic `monerod` behavior.
                     return Err(StatusCode::FORBIDDEN);
                 }
 
-                // Send request.
-                let Ok(response) = $handler.oneshot($request).await else {
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                };
+                let response = $handler.oneshot($request).await.map_err(|e| { eprintln!("BIN RPC handler error: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
                 let BinResponse::$variant(response) = response else {
                     panic!("RPC handler returned incorrect response");
                 };
 
-                // Serialize to bytes and respond.
                 match cuprate_epee_encoding::to_bytes(response) {
-                    Ok(bytes) => Ok(bytes.freeze()),
-                    Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+                    Ok(bytes) => {
+                        let frozen = bytes.freeze();
+                        eprintln!("[BIN RPC] {} response_size={}", stringify!($variant), frozen.len());
+                        Ok(frozen)
+                    },
+                    Err(e) => {
+                        eprintln!("[BIN RPC] {} serialization error: {e:?}", stringify!($variant));
+                        Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    },
                 }
             }
         }

@@ -42,7 +42,7 @@ use crate::{
         },
         block::{
             block_exists, get_block, get_block_blob_with_tx_indexes, get_block_by_hash,
-            get_block_complete_entry, get_block_complete_entry_from_height,
+            get_block_complete_entry, get_block_complete_entry_from_height, get_block_complete_entry_from_height_pruned,
             get_block_extended_header_from_height, get_block_height, get_block_info,
         },
         blockchain::{cumulative_generated_coins, find_split_point, top_block_height},
@@ -112,6 +112,7 @@ fn map_request(
     match request {
         R::BlockCompleteEntries(block_hashes) => block_complete_entries(env, block_hashes),
         R::BlockCompleteEntriesByHeight(heights) => block_complete_entries_by_height(env, heights),
+        R::BlockCompleteEntriesByHeightPruned(heights) => block_complete_entries_by_height_pruned(env, heights),
         R::BlockExtendedHeader(block) => block_extended_header(env, block),
         R::BlockHash(block, chain) => block_hash(env, block, chain),
         R::BlockHashInRange(blocks, chain) => block_hash_in_range(env, blocks, chain),
@@ -149,6 +150,7 @@ fn map_request(
         R::Transactions { tx_hashes } => transactions(env, tx_hashes),
         R::TotalRctOutputs => total_rct_outputs(env),
         R::TxOutputIndexes { tx_hash } => tx_output_indexes(env, &tx_hash),
+        R::TxOutputIndexesBatch(tx_hashes) => tx_output_indexes_batch(env, tx_hashes),
         R::OutputDistribution(input) => output_distribution(env, input),
     }
 
@@ -278,6 +280,27 @@ fn block_complete_entries_by_height(
 
     let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
     let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
+
+    Ok(BlockchainResponse::BlockCompleteEntriesByHeight(blocks))
+}
+
+/// Like [`block_complete_entries_by_height`] but reads pruned TX blobs.
+fn block_complete_entries_by_height_pruned(
+    env: &ConcreteEnv,
+    block_heights: Vec<BlockHeight>,
+) -> ResponseResult {
+    let env_inner = env.env_inner();
+    let tx_ro = thread_local(env);
+    let tables = thread_local(env);
+
+    let blocks = block_heights
+        .into_par_iter()
+        .map(|height| {
+            let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
+            let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
+            get_block_complete_entry_from_height_pruned(&height, tables)
+        })
+        .collect::<DbResult<_>>()?;
 
     Ok(BlockchainResponse::BlockCompleteEntriesByHeight(blocks))
 }
@@ -977,6 +1000,26 @@ fn tx_output_indexes(env: &ConcreteEnv, tx_hash: &[u8; 32]) -> ResponseResult {
 }
 
 /// [`BlockchainReadRequest::OutputDistribution`]
+
+/// Batch version of [`tx_output_indexes`] — single DB transaction for all lookups.
+fn tx_output_indexes_batch(env: &ConcreteEnv, tx_hashes: Vec<[u8; 32]>) -> ResponseResult {
+    let env_inner = env.env_inner();
+    let tx_ro = env_inner.tx_ro()?;
+    let table_tx_ids = env_inner.open_db_ro::<TxIds>(&tx_ro)?;
+    let table_tx_outputs = env_inner.open_db_ro::<TxOutputs>(&tx_ro)?;
+
+    let results = tx_hashes
+        .iter()
+        .map(|tx_hash| {
+            let tx_id = table_tx_ids.get(tx_hash)?;
+            let o_indexes = table_tx_outputs.get(&tx_id)?;
+            Ok(o_indexes.0)
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+
+    Ok(BlockchainResponse::TxOutputIndexesBatch(results))
+}
+
 fn output_distribution(env: &ConcreteEnv, input: OutputDistributionInput) -> ResponseResult {
     Ok(BlockchainResponse::OutputDistribution(todo!()))
 }

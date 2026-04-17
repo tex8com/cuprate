@@ -42,6 +42,9 @@ pub enum BlockchainReadRequest {
     /// The input is the block heights.
     BlockCompleteEntriesByHeight(Vec<usize>),
 
+    /// Same as above but returns pruned TX blobs.
+    BlockCompleteEntriesByHeightPruned(Vec<usize>),
+
     /// Request a block's extended header.
     ///
     /// The input is the block's height.
@@ -208,6 +211,8 @@ pub enum BlockchainReadRequest {
 
     /// Get the output indexes of a transaction.
     TxOutputIndexes { tx_hash: [u8; 32] },
+    /// Batch lookup of output indexes for multiple transactions.
+    TxOutputIndexesBatch(Vec<[u8; 32]>),
 }
 
 //---------------------------------------------------------------------------------------------------- WriteRequest
@@ -427,6 +432,8 @@ pub enum BlockchainResponse {
 
     /// Response to [`BlockchainReadRequest::TxOutputIndexes`].
     TxOutputIndexes(Vec<u64>),
+    /// Response to [`BlockchainReadRequest::TxOutputIndexesBatch`].
+    TxOutputIndexesBatch(Vec<Vec<u64>>),
 
     //------------------------------------------------------ Writes
     /// A generic Ok response to indicate a request was successfully handled.

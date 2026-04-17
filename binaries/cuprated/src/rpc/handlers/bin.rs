@@ -5,6 +5,7 @@
 //! <https://github.com/Cuprate/cuprate/pull/355>
 
 use std::num::NonZero;
+use std::time::Instant;
 
 use anyhow::{anyhow, Error};
 use cuprate_constants::rpc::{
@@ -37,8 +38,8 @@ use crate::rpc::{
     CupratedRpcHandler,
 };
 
-const GET_BLOCKS_BIN_MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
-const GET_BLOCKS_BIN_FETCH_BATCH: usize = 128;
+const GET_BLOCKS_BIN_MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+const GET_BLOCKS_BIN_FETCH_BATCH: usize = 1000;
 
 /// Map a [`BinRequest`] to the function that will lead to a [`BinResponse`].
 pub async fn map_request(
@@ -170,10 +171,15 @@ async fn get_blocks(
         .saturating_sub(response_start_height)
         .min(u64_to_usize(max_blocks));
 
+    let t_blocks = Instant::now();
     let blocks =
-        capped_block_complete_entries(&mut state, response_start_height, chain_height, block_count)
+        capped_block_complete_entries(&mut state, response_start_height, chain_height, block_count, prune)
             .await?;
+    eprintln!("[RPC] GetBlocks: {} blocks, pruned={}, start={}, current_height={}", blocks.len(), prune, response_start_height, usize_to_u64(chain_height));
+    eprintln!("[TIMING] block_fetch: {:.1}ms ({} blocks)", t_blocks.elapsed().as_secs_f64() * 1000.0, blocks.len());
+    let t_oi = Instant::now();
     let output_indices = output_indices_for_blocks(&mut state, &blocks, no_miner_tx).await?;
+    eprintln!("[TIMING] output_indices_total: {:.1}ms", t_oi.elapsed().as_secs_f64() * 1000.0);
 
     Ok(GetBlocksResponse {
         blocks,
@@ -219,6 +225,7 @@ async fn capped_block_complete_entries(
     response_start_height: usize,
     chain_height: usize,
     block_count: usize,
+    prune: bool,
 ) -> Result<Vec<BlockCompleteEntry>, Error> {
     let mut blocks = Vec::new();
     let mut response_bytes = 0_usize;
@@ -234,9 +241,13 @@ async fn capped_block_complete_entries(
             .saturating_add(GET_BLOCKS_BIN_FETCH_BATCH)
             .min(end_height);
         let heights = (next_height..batch_end).map(usize_to_u64).collect();
-        let batch =
-            blockchain::block_complete_entries_by_height(&mut state.blockchain_read, heights)
-                .await?;
+        let batch = if prune {
+                blockchain::block_complete_entries_by_height_pruned(&mut state.blockchain_read, heights)
+                    .await?
+            } else {
+                blockchain::block_complete_entries_by_height(&mut state.blockchain_read, heights)
+                    .await?
+            };
 
         for block in batch {
             let block_response_bytes = block_response_bytes(&block);
@@ -252,7 +263,7 @@ async fn capped_block_complete_entries(
 
             response_bytes = response_bytes.saturating_add(block_response_bytes);
             tx_count = tx_count.saturating_add(block_tx_count);
-            blocks.push(block);
+                        blocks.push(block);
         }
 
         next_height = batch_end;
@@ -283,33 +294,56 @@ async fn output_indices_for_blocks(
     blocks: &[BlockCompleteEntry],
     no_miner_tx: bool,
 ) -> Result<Vec<BlockOutputIndices>, Error> {
-    let mut output_indices = Vec::with_capacity(blocks.len());
+    let t_idx = Instant::now();
+
+    // Parse all blocks and collect all tx hashes for a single batch lookup
+    let mut all_blocks_parsed = Vec::with_capacity(blocks.len());
+    let mut all_tx_hashes: Vec<[u8; 32]> = Vec::new();
 
     for block in blocks {
         let parsed_block = Block::read(&mut block.block.as_ref())?;
-        let mut indices = Vec::with_capacity(parsed_block.transactions.len() + 1);
-
-        if no_miner_tx {
-            indices.push(TxOutputIndices { indices: vec![] });
-        } else {
-            indices.push(TxOutputIndices {
-                indices: blockchain::tx_output_indexes(
-                    &mut state.blockchain_read,
-                    parsed_block.miner_transaction().hash(),
-                )
-                .await?,
-            });
+        if !no_miner_tx {
+            all_tx_hashes.push(parsed_block.miner_transaction().hash());
         }
-
-        for tx_hash in parsed_block.transactions {
-            indices.push(TxOutputIndices {
-                indices: blockchain::tx_output_indexes(&mut state.blockchain_read, tx_hash).await?,
-            });
+        for tx_hash in &parsed_block.transactions {
+            all_tx_hashes.push(*tx_hash);
         }
-
-        output_indices.push(BlockOutputIndices { indices });
+        all_blocks_parsed.push(parsed_block);
     }
 
+    let total_txs = all_tx_hashes.len();
+    eprintln!("[TIMING] index_parse: {:.1}ms ({} blocks, {} txs)", t_idx.elapsed().as_secs_f64() * 1000.0, blocks.len(), total_txs);
+
+    // Single batch DB lookup for all output indices
+    let t_db = Instant::now();
+    let all_indices = blockchain::tx_output_indexes_batch(
+        &mut state.blockchain_read,
+        all_tx_hashes,
+    ).await?;
+    eprintln!("[TIMING] index_db_batch: {:.1}ms ({} lookups)", t_db.elapsed().as_secs_f64() * 1000.0, total_txs);
+
+    // Reconstruct per-block output indices
+    let mut idx = 0;
+    let mut output_indices = Vec::with_capacity(blocks.len());
+    for parsed_block in &all_blocks_parsed {
+        let mut block_indices = Vec::with_capacity(parsed_block.transactions.len() + 1);
+
+        if no_miner_tx {
+            block_indices.push(TxOutputIndices { indices: vec![] });
+        } else {
+            block_indices.push(TxOutputIndices { indices: all_indices[idx].clone() });
+            idx += 1;
+        }
+
+        for _ in &parsed_block.transactions {
+            block_indices.push(TxOutputIndices { indices: all_indices[idx].clone() });
+            idx += 1;
+        }
+
+        output_indices.push(BlockOutputIndices { indices: block_indices });
+    }
+
+    eprintln!("[TIMING] index_total: {:.1}ms", t_idx.elapsed().as_secs_f64() * 1000.0);
     Ok(output_indices)
 }
 
@@ -337,6 +371,7 @@ async fn get_hashes(
     mut state: CupratedRpcHandler,
     request: GetHashesRequest,
 ) -> Result<GetHashesResponse, Error> {
+    eprintln!("[RPC] GetHashes: block_ids.len()={}, start_height={}", request.block_ids.len(), request.start_height);
     let GetHashesRequest {
         start_height,
         block_ids,
@@ -355,18 +390,20 @@ async fn get_hashes(
 
     let hashes: Vec<[u8; 32]> = (&block_ids).into();
 
-    let (m_blocks_ids, first_known_height, current_height) = blockchain::next_chain_entry(
+    let (m_block_ids, first_known_height, current_height) = blockchain::next_chain_entry(
         &mut state.blockchain_read,
         hashes,
         GET_BLOCKS_BIN_MAX_BLOCK_COUNT,
     )
     .await?;
+    eprintln!("[RPC] GetHashes: got {} hashes, first_known={:?}, current_height={}", m_block_ids.len(), first_known_height, current_height);
     let first_known_height =
         first_known_height.ok_or_else(|| anyhow!("Block IDs were not sorted properly"))?;
 
+    eprintln!("[RPC] GetHashes: responding with {} hashes, start_height={}", m_block_ids.len(), first_known_height);
     Ok(GetHashesResponse {
         base: helper::access_response_base(false),
-        m_blocks_ids: m_blocks_ids.into(),
+        m_block_ids: m_block_ids.into(),
         current_height: usize_to_u64(current_height),
         start_height: usize_to_u64(first_known_height),
     })

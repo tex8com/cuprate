@@ -5,9 +5,11 @@ use bytemuck::TransparentWrapper;
 use bytes::Bytes;
 use monero_oxide::{
     block::{Block, BlockHeader},
+    primitives::keccak256,
     transaction::Transaction,
 };
 
+use cuprate_fixed_bytes::ByteArray;
 use cuprate_database::{
     DbResult, RuntimeError, StorableVec, {DatabaseRo, DatabaseRw},
 };
@@ -18,7 +20,7 @@ use cuprate_helper::{
 };
 use cuprate_types::{
     AltBlockInformation, BlockCompleteEntry, ChainId, ExtendedBlockHeader, HardFork,
-    TransactionBlobs, VerifiedBlockInformation, VerifiedTransactionInformation,
+    PrunedTxBlobEntry, TransactionBlobs, VerifiedBlockInformation, VerifiedTransactionInformation,
 };
 
 use crate::{
@@ -295,6 +297,52 @@ pub fn get_block_complete_entry_from_height(
     })
 }
 
+/// On-the-fly pruned block entry with real TransactionBlobs::Pruned format.
+pub fn get_block_complete_entry_from_height_pruned(
+    block_height: &BlockHeight,
+    tables: &impl TablesIter,
+) -> Result<BlockCompleteEntry, RuntimeError> {
+    let (block_blob, miner_tx_idx, numb_non_miner_txs) =
+        get_block_blob_with_tx_indexes(block_height, tables)?;
+
+    let first_tx_idx = miner_tx_idx + 1;
+
+    let pruned_entries = (first_tx_idx..(usize_to_u64(numb_non_miner_txs) + first_tx_idx))
+        .map(|idx| {
+            let tx_blob = tables.tx_blobs().get(&idx)?.0;
+            let tx = Transaction::read(&mut tx_blob.as_slice())
+                .map_err(|_| RuntimeError::Io(std::io::Error::other("failed to parse tx")))?;
+
+            if tx.version() == 1 {
+                Ok(PrunedTxBlobEntry {
+                    blob: Bytes::from(tx_blob),
+                    prunable_hash: ByteArray::from([0u8; 32]),
+                })
+            } else {
+                let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
+                if prunable_bytes.is_empty() {
+                    Ok(PrunedTxBlobEntry {
+                        blob: Bytes::from(tx_blob),
+                        prunable_hash: ByteArray::from([0u8; 32]),
+                    })
+                } else {
+                    Ok(PrunedTxBlobEntry {
+                        blob: Bytes::from(pruned_tx.serialize()),
+                        prunable_hash: ByteArray::from(keccak256(&prunable_bytes)),
+                    })
+                }
+            }
+        })
+        .collect::<Result<_, RuntimeError>>()?;
+
+    Ok(BlockCompleteEntry {
+        block: Bytes::from(block_blob),
+        txs: TransactionBlobs::Pruned(pruned_entries),
+        pruned: true,
+        block_weight: 0,
+    })
+}
+
 //---------------------------------------------------------------------------------------------------- `get_block_extended_header_*`
 /// Retrieve a [`ExtendedBlockHeader`] from the database.
 ///
@@ -420,7 +468,8 @@ pub fn block_exists(
 mod test {
     use pretty_assertions::assert_eq;
 
-    use cuprate_database::{Env, EnvInner, TxRw};
+    use cuprate_fixed_bytes::ByteArray;
+use cuprate_database::{Env, EnvInner, TxRw};
     use cuprate_test_utils::data::{BLOCK_V16_TX0, BLOCK_V1_TX2, BLOCK_V9_TX3};
 
     use crate::{

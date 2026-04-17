@@ -50,7 +50,7 @@ define_request_and_response! {
         start_height: u64,
     },
     AccessResponseBase {
-        m_blocks_ids: ByteArrayVec<32> = default::<ByteArrayVec<32>>(), "default",
+        m_block_ids: ByteArrayVec<32> = default::<ByteArrayVec<32>>(), "default",
         start_height: u64,
         current_height: u64,
     }

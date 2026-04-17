@@ -539,6 +539,26 @@ pub async fn block_complete_entries_by_height(
     Ok(blocks)
 }
 
+/// Like [`block_complete_entries_by_height`] but returns pruned TX blobs.
+pub async fn block_complete_entries_by_height_pruned(
+    blockchain_read: &mut BlockchainReadHandle,
+    block_heights: Vec<u64>,
+) -> Result<Vec<BlockCompleteEntry>, Error> {
+    // Use the same request - the pruning happens in the storage layer
+    let BlockchainResponse::BlockCompleteEntriesByHeight(blocks) = blockchain_read
+        .ready()
+        .await?
+        .call(BlockchainReadRequest::BlockCompleteEntriesByHeightPruned(
+            block_heights.into_iter().map(u64_to_usize).collect(),
+        ))
+        .await?
+    else {
+        unreachable!();
+    };
+
+    Ok(blocks)
+}
+
 /// [`BlockchainReadRequest::TxOutputIndexes`].
 pub async fn tx_output_indexes(
     blockchain_read: &mut BlockchainReadHandle,
@@ -554,4 +574,21 @@ pub async fn tx_output_indexes(
     };
 
     Ok(o_indexes)
+}
+
+
+pub async fn tx_output_indexes_batch(
+    blockchain_read: &mut BlockchainReadHandle,
+    tx_hashes: Vec<[u8; 32]>,
+) -> Result<Vec<Vec<u64>>, Error> {
+    let BlockchainResponse::TxOutputIndexesBatch(indices) = blockchain_read
+        .ready()
+        .await?
+        .call(BlockchainReadRequest::TxOutputIndexesBatch(tx_hashes))
+        .await?
+    else {
+        unreachable!();
+    };
+
+    Ok(indices)
 }

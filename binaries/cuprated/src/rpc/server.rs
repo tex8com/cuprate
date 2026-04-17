@@ -8,6 +8,7 @@ use std::{
 use anyhow::Error;
 use tokio::net::TcpListener;
 use tower::limit::rate::RateLimitLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
@@ -142,6 +143,8 @@ async fn run_rpc_server(
         .bin_get_output_distribution()
         .fallback()
         .build()
+        .route("/get_info", axum::routing::any(get_info_proxy::<CupratedRpcHandler>))
+        .route("/getinfo", axum::routing::any(get_info_proxy::<CupratedRpcHandler>))
         .with_state(rpc_handler);
 
     // Add restrictive layers if restricted RPC.
@@ -153,6 +156,11 @@ async fn run_rpc_server(
         router
     };
 
+    // Optional gzip compression: only compresses if the client sends
+    // `Accept-Encoding: gzip`. Standard wallets don't send this header
+    // and get uncompressed responses (fully compatible).
+    let router = router.layer(CompressionLayer::new().gzip(true).no_br().no_deflate().no_zstd());
+
     // Start the server.
     //
     // TODO: impl custom server code, don't use axum.
@@ -160,4 +168,41 @@ async fn run_rpc_server(
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+
+/// Proxy /get_info to the JSON-RPC get_info handler.
+/// The Monero wallet calls this endpoint directly (not via /json_rpc).
+async fn get_info_proxy<H: cuprate_rpc_interface::RpcHandler>(
+    axum::extract::State(handler): axum::extract::State<H>,
+) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+    use tower::ServiceExt;
+    use cuprate_rpc_types::json::{JsonRpcRequest, JsonRpcResponse};
+    
+    eprintln!("[RPC] /get_info endpoint called");
+    
+    let request = JsonRpcRequest::GetInfo(Default::default());
+    
+    let response = handler
+        .oneshot(request)
+        .await
+        .map_err(|e| {
+            eprintln!("[RPC] /get_info handler error: {e:?}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    let JsonRpcResponse::GetInfo(info) = response else {
+        eprintln!("[RPC] /get_info wrong response variant");
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    
+    eprintln!("[RPC] /get_info success, height={}", info.height);
+    
+    // Serialize the response as JSON - the wallet expects a flat JSON object
+    let json = serde_json::to_value(&info).map_err(|e| {
+        eprintln!("[RPC] /get_info serialize error: {e:?}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    Ok(axum::Json(json))
 }
