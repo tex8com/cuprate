@@ -9,6 +9,41 @@ _(work-in-progress)_
 
 </div>
 
+## TEX8 Fork — Wallet Sync Optimizations (`fast-rpc` branch)
+
+**Author:** Roland Kohlhuber  
+**Optimized Wallet:** [tex8com/monero-gui](https://github.com/tex8com/monero-gui/tree/fast-crypto) — use both together for gzip compression + larger batches
+
+This fork adds wallet-compatible RPC endpoints and performance optimizations that reduce wallet sync time from **24 minutes to 4 seconds** (360x faster).
+
+### What changed
+
+| Optimization | Impact | Files |
+|-------------|--------|-------|
+| **`m_block_ids` field name fix** | Enables `fast_refresh` (hash-only sync). Data: 812 MB → 13 MB | `rpc/types/src/bin.rs` |
+| **On-the-fly TX pruning** | Strips RCT prunable data via `monero_oxide::Transaction::pruned_with_prunable()`. TX data ~5x smaller | `storage/blockchain/src/ops/block.rs` |
+| **Batch output-index lookups** | 1 DB transaction instead of ~6,600 individual calls. Server compute: 30s → 0.66s per batch (46x faster) | `types/types/src/blockchain.rs`, `storage/blockchain/src/service/read.rs`, `binaries/cuprated/src/rpc/service/blockchain.rs` |
+| **Optional gzip compression** | Compresses binary RPC responses when client sends `Accept-Encoding: gzip`. Standard wallets get uncompressed responses (fully compatible) | `rpc/interface/src/route/bin.rs`, `rpc/interface/Cargo.toml` |
+| **50 MB response cap** | Optimal batch size for pruned block data | `binaries/cuprated/src/rpc/handlers/bin.rs` |
+| **Timing logs** | `[TIMING]` diagnostics for block_fetch, index_parse, index_db_batch | `binaries/cuprated/src/rpc/handlers/bin.rs` |
+
+### Benchmark (45,000 blocks, same wallet)
+
+| Setup | Sync Time | Data Transferred |
+|-------|-----------|-----------------|
+| Standard wallet + monerod (public) | 19s | 22 MB |
+| Standard wallet + **this node** | 12s | 13 MB |
+| [tex8com/monero-gui](https://github.com/tex8com/monero-gui/tree/fast-crypto) + **this node** | **4s** | gzip compressed |
+| This node (localhost, no network) | **4s** | — |
+
+### Compatibility
+
+- Standard Monero wallets (monero-wallet-cli, monero-wallet-gui) work without changes
+- gzip compression is **opt-in**: only active when the wallet sends `Accept-Encoding: gzip`
+- All existing Monero RPC endpoints are supported
+
+---
+
 ## Contents
 
 - [About](#about)

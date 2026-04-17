@@ -251,6 +251,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -787,6 +788,7 @@ checksum = "ef8a506ec4b81c460798f572caead636d57d3d7e940f998160f52bd254bf2d23"
 dependencies = [
  "compression-core",
  "flate2",
+ "memchr",
 ]
 
 [[package]]
@@ -1089,6 +1091,7 @@ dependencies = [
  "cuprate-constants",
  "cuprate-database",
  "cuprate-database-service",
+ "cuprate-fixed-bytes",
  "cuprate-helper",
  "cuprate-pruning",
  "cuprate-test-utils",
@@ -1466,6 +1469,7 @@ dependencies = [
  "cuprate-json-rpc",
  "cuprate-rpc-types",
  "cuprate-test-utils",
+ "flate2",
  "futures",
  "paste",
  "serde",
@@ -6559,12 +6563,16 @@ version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adc82fd73de2a9722ac5da747f12383d2bfdb93591ee6c58486e0097890f05f2"
 dependencies = [
+ "async-compression",
  "bitflags 2.10.0",
  "bytes",
+ "futures-core",
  "http",
  "http-body",
  "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
 ]

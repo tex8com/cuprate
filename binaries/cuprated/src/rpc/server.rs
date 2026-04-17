@@ -156,11 +156,6 @@ async fn run_rpc_server(
         router
     };
 
-    // Optional gzip compression: only compresses if the client sends
-    // `Accept-Encoding: gzip`. Standard wallets don't send this header
-    // and get uncompressed responses (fully compatible).
-    let router = router.layer(CompressionLayer::new().gzip(true).no_br().no_deflate().no_zstd());
-
     // Start the server.
     //
     // TODO: impl custom server code, don't use axum.
