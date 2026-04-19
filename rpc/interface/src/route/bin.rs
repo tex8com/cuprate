@@ -70,15 +70,25 @@ macro_rules! generate_endpoints_with_input {
             ) -> Result<axum::response::Response, StatusCode> {
                 let _perf_total = std::time::Instant::now();
                 let _active = ACTIVE_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
-                let _reqid = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst);
-                eprintln!("[PERF RPC] {} BEGIN id={} active={} req_bytes={}", stringify!($variant), _reqid, _active, request.len());
+                // Prefer the client-supplied X-Perf-Req-Id header for cross-machine correlation.
+                // Fallback to internal counter when header missing.
+                let _reqid: String = headers.get("x-perf-req-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst).to_string());
+                // Wall-clock epoch ms (matches wallet's send_epoch_ms / recv_epoch_ms).
+                let _recv_epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                eprintln!("[PERF RPC] {} BEGIN id={} active={} req_bytes={} recv_epoch_ms={}", stringify!($variant), _reqid, _active, request.len(), _recv_epoch_ms);
                 let request = BinRequest::$variant(
                     from_bytes(&mut request).map_err(|e| { eprintln!("BIN RPC deserialization error: {e:?}, remaining_bytes={}", request.len()); StatusCode::INTERNAL_SERVER_ERROR })?
                 );
 
                 let _result = generate_endpoints_inner!($variant, handler, headers, request);
                 let _active_after = ACTIVE_REQUESTS.fetch_sub(1, Ordering::SeqCst) - 1;
-                eprintln!("[PERF RPC] {} END id={} active_remaining={} total_ms={:.1}", stringify!($variant), _reqid, _active_after, _perf_total.elapsed().as_secs_f64() * 1000.0);
+                let _send_epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                eprintln!("[PERF RPC] {} END id={} active_remaining={} total_ms={:.1} recv_epoch_ms={} send_epoch_ms={}", stringify!($variant), _reqid, _active_after, _perf_total.elapsed().as_secs_f64() * 1000.0, _recv_epoch_ms, _send_epoch_ms);
                 _result
             }
         )*
