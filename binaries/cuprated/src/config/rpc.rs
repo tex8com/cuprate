@@ -21,6 +21,14 @@ config_struct! {
         #[child = true]
         /// Configuration for the restricted RPC server.
         pub restricted: RestrictedRpcConfig,
+
+        #[child = true]
+        /// Configuration for the gRPC streaming RPC server (opt-in,
+        /// disabled by default). Uses HTTP/2 multiplexing + server-streaming
+        /// to remove the per-TCP-connection variance that limits the bin
+        /// RPC. Compatible wallets can opt in for ~1.6-1.8x more throughput;
+        /// standard wallets keep using bin RPC unchanged.
+        pub grpc: GrpcConfig,
     }
 }
 
@@ -116,6 +124,68 @@ impl Default for RestrictedRpcConfig {
             // <https://github.com/monero-project/monero/blob/3b01c490953fe92f3c6628fa31d280a4f0490d28/src/cryptonote_config.h#L134>
             request_byte_limit: 1024 * 1024,
         }
+    }
+}
+
+config_struct! {
+    /// gRPC streaming server config (opt-in, disabled by default).
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct GrpcConfig {
+        /// The address the gRPC server will listen on.
+        ///
+        /// Type     | IPv4/IPv6 address
+        /// Examples | "127.0.0.1", "0.0.0.0", "::"
+        pub address: IpAddr,
+
+        /// The port the gRPC server will listen on.
+        ///
+        /// Type         | Number or "Default"
+        /// Valid values | 0..65534, "Default"
+        /// Examples     | 18091, 28091, 38091
+        pub port: DefaultOrCustom<u16>,
+
+        /// Toggle the gRPC server.
+        ///
+        /// Default `false` — opt-in.
+        ///
+        /// Type     | boolean
+        /// Examples | true, false
+        pub enable: bool,
+
+        /// Allow the gRPC server to bind a non-local address.
+        ///
+        /// Same safety guard as unrestricted bin RPC: refuses to start on
+        /// a public address unless explicitly set to true. The gRPC service
+        /// exposes the same blockchain data the unrestricted bin RPC does,
+        /// so the same risk profile applies.
+        ///
+        /// Type     | boolean
+        /// Examples | true, false
+        pub i_know_what_im_doing_allow_public_grpc: bool,
+    }
+}
+
+impl Default for GrpcConfig {
+    fn default() -> Self {
+        Self {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: DefaultOrCustom::Default,
+            enable: false,
+            i_know_what_im_doing_allow_public_grpc: false,
+        }
+    }
+}
+
+/// Gets the port to listen on for the gRPC streaming server.
+pub const fn grpc_rpc_port(config: DefaultOrCustom<u16>, network: Network) -> u16 {
+    match config {
+        DefaultOrCustom::Default => match network {
+            Network::Mainnet => 18091,
+            Network::Stagenet => 38091,
+            Network::Testnet => 28091,
+        },
+        DefaultOrCustom::Custom(port) => port,
     }
 }
 

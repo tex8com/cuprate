@@ -19,8 +19,8 @@ use cuprate_rpc_interface::{RouterBuilder, RpcHandler};
 use cuprate_txpool::service::TxpoolReadHandle;
 
 use crate::{
-    config::{restricted_rpc_port, unrestricted_rpc_port, RpcConfig},
-    rpc::{rpc_handler::BlockchainManagerHandle, CupratedRpcHandler},
+    config::{grpc_rpc_port, restricted_rpc_port, unrestricted_rpc_port, GrpcConfig, RpcConfig},
+    rpc::{grpc, rpc_handler::BlockchainManagerHandle, CupratedRpcHandler},
     txpool::IncomingTxHandler,
 };
 
@@ -97,6 +97,55 @@ pub fn init_rpc_servers(
             .unwrap();
         });
     }
+
+    // Optional gRPC streaming server (opt-in, disabled by default).
+    if config.grpc.enable {
+        let grpc_handler = CupratedRpcHandler::new(
+            false, // gRPC service is unrestricted (same data exposure as bin RPC unrestricted)
+            blockchain_read.clone(),
+            blockchain_context.clone(),
+            txpool_read.clone(),
+            tx_handler.clone(),
+        );
+        let grpc_addr = config.grpc.address;
+        let grpc_port = grpc_rpc_port(config.grpc.port, network);
+        let allow_public = config.grpc.i_know_what_im_doing_allow_public_grpc;
+        if !cuprate_helper::net::ip_is_local(grpc_addr) && !allow_public {
+            panic!("Refusing to start gRPC RPC on a non-local address ({grpc_addr}) without i_know_what_im_doing_allow_public_grpc");
+        }
+        if !cuprate_helper::net::ip_is_local(grpc_addr) {
+            warn!(address = %grpc_addr, "Starting gRPC server on non-local address");
+        }
+        let bind = SocketAddr::new(grpc_addr, grpc_port);
+        tokio::task::spawn(async move {
+            if let Err(e) = run_grpc_server(grpc_handler, bind).await {
+                eprintln!("[GRPC] server task exited with error: {e:?}");
+            }
+        });
+    } else {
+        info!("gRPC streaming RPC disabled (set rpc.grpc.enable = true to enable)");
+    }
+}
+
+/// Initializes and runs the gRPC streaming RPC server (tonic, HTTP/2).
+///
+/// The function only returns when the server itself returns or an error
+/// occurs. Coexists with the bin RPC axum server on a separate port.
+async fn run_grpc_server(rpc_handler: CupratedRpcHandler, address: SocketAddr) -> Result<(), Error> {
+    use tonic::transport::Server;
+
+    eprintln!("[GRPC] Starting BlockStream server at {address}");
+    info!(address = %address, "Starting gRPC streaming server");
+
+    let svc = grpc::block_stream_service(rpc_handler);
+
+    Server::builder()
+        .add_service(svc)
+        .serve(address)
+        .await
+        .map_err(|e| anyhow::anyhow!("tonic server error: {e}"))?;
+
+    Ok(())
 }
 
 /// This initializes and runs an RPC server.

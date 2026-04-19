@@ -48,7 +48,7 @@ mod macros;
 use fs::FileSystemConfig;
 pub use p2p::{p2p_port, P2PConfig};
 use rayon::RayonConfig;
-pub use rpc::{restricted_rpc_port, unrestricted_rpc_port, RpcConfig};
+pub use rpc::{grpc_rpc_port, restricted_rpc_port, unrestricted_rpc_port, GrpcConfig, RpcConfig};
 pub use storage::{StorageConfig, TxpoolConfig};
 use tokio::TokioConfig;
 use tor::TorConfig;
