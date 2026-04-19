@@ -10,9 +10,9 @@
 //! - [`helper`] contains helper functions used by many handlers
 //! - [`shared`] contains shared functions used by multiple handlers
 
-pub(super) mod bin;
+pub(crate) mod bin;
 pub(super) mod json_rpc;
 pub(super) mod other_json;
 
-mod helper;
+pub(crate) mod helper;
 mod shared;

@@ -6,9 +6,17 @@
 // the per-TCP-connection variance ceiling that limits the bin RPC to roughly
 // half of the available link bandwidth.
 //
-// Block payload format: each `BlockChunk.blocks[i]` is the same epee-serialized
-// `block_complete_entry` blob the bin RPC produces — so the wallet can reuse
-// its existing block-parser without writing a second deserializer.
+// Design choice — payload is epee, transport is gRPC:
+//
+// Each BlockChunk.payload is the same epee-serialized GetBlocksResponse the
+// bin RPC produces (with most fields empty — only blocks, output_indices,
+// start_height, current_height, status are populated). The wallet decodes it
+// with its EXISTING `COMMAND_RPC_GET_BLOCKS_FAST::response` deserializer, so
+// no new payload parser is needed on the wallet side. The protobuf layer is
+// purely the envelope that gives us HTTP/2 multiplexing + flow control +
+// server-streaming. That is where ALL of the network-layer wins come from;
+// the inner serialization format is irrelevant for throughput on crypto
+// payloads (which are near-incompressible regardless).
 //
 // Status: experimental. Wire-compatibility is NOT promised across versions
 // until v1; pin the proto file to the cuprated commit you build against.
@@ -25,16 +33,17 @@ service BlockStream {
   //   - tip is reached (current chain top served), OR
   //   - the client cancels the RPC
   //
-  // The server MUST emit BlockChunks with strictly monotonically increasing
+  // The server emits BlockChunks with strictly monotonically increasing
   // start_heights and contiguous block ranges (no gaps, no overlap). On
-  // chain-tip catch-up the server MAY pause the stream (no chunks) until
-  // a new block is available; the client should not interpret a pause as
+  // chain-tip catch-up the server MAY pause the stream (no chunks) until a
+  // new block is available; the client should not interpret a pause as
   // end-of-stream.
   rpc StreamBlocks(StreamBlocksRequest) returns (stream BlockChunk);
 
   // Future: streaming hash-only sync (replaces bin `get_hashes` for the
-  // fast_refresh phase).  Not implemented yet — wallet still uses
-  // BlockHashInRange via bin RPC for that.
+  // fast_refresh phase). Not implemented yet — the wallet still uses the
+  // BlockHashInRange DIRECT-BULK path via bin RPC, which is already fast
+  // enough (~12 ms per 100k hashes).
   // rpc StreamHashes(StreamHashesRequest) returns (stream HashChunk);
 }
 
@@ -49,8 +58,8 @@ message StreamBlocksRequest {
   // sync — saves ~5x bandwidth). If false, full blocks are sent.
   bool prune = 3;
 
-  // Hint for preferred chunk size (number of blocks per BlockChunk message).
-  // Server may ignore or clamp. 0 = server default (currently 100).
+  // Hint for preferred chunk size (number of blocks per BlockChunk).
+  // Server may ignore or clamp. 0 = server default (currently 200).
   uint32 chunk_blocks_hint = 4;
 
   // If true, miner txs are stripped (parity with bin RPC's no_miner_tx).
@@ -63,38 +72,32 @@ message StreamBlocksRequest {
 }
 
 message BlockChunk {
-  // Height of `blocks[0]`. Subsequent blocks in this chunk are at
-  // start_height+1, start_height+2, ...
+  // Height of the first block in this chunk's payload. Subsequent blocks in
+  // this chunk are at start_height+1, start_height+2, ...
   uint64 start_height = 1;
 
-  // Each entry is a fully epee-serialized `block_complete_entry` exactly
-  // as the bin RPC would emit it. Reuses the wallet's existing parser.
-  repeated bytes blocks = 2;
-
-  // Per-tx output indices, parallel to `blocks` and to the txs within each
-  // block. `indices[i].tx[j].idx` corresponds to the j-th tx of the i-th
-  // block in this chunk. Empty if the wallet does not need indices
-  // (currently always populated for parity with bin RPC).
-  repeated BlockOutputIndices indices = 3;
+  // Sequence number of this chunk within the stream (0, 1, 2, ...).
+  // Useful for detecting drops/duplicates in client logs.
+  uint64 chunk_seq = 2;
 
   // Current chain tip height as observed by the server when this chunk was
   // emitted. Lets the wallet update its progress bar without a separate
   // get_info round-trip. Will increase across chunks as new blocks arrive.
-  uint64 chain_tip = 4;
+  uint64 chain_tip = 3;
 
   // Server-side request id (auto-generated if client did not supply one).
   // Echoed in every chunk so the client can correlate.
-  string server_request_id = 5;
+  string server_request_id = 4;
 
-  // Sequence number of this chunk within the stream (0, 1, 2, ...).
-  // Useful for detecting drops/duplicates in logs.
-  uint64 chunk_seq = 6;
-}
+  // The epee-serialized payload — exactly the wire format the bin RPC's
+  // GetBlocks endpoint returns. Most fields are empty/default (no pool
+  // info, no daemon_time, no base.untrusted etc.) — only `blocks`,
+  // `output_indices`, `start_height`, `current_height` and `status` are
+  // populated. Decode on the wallet side with the existing
+  // `COMMAND_RPC_GET_BLOCKS_FAST::response` epee deserializer.
+  bytes payload = 5;
 
-message BlockOutputIndices {
-  repeated TxOutputIndices tx = 1;
-}
-
-message TxOutputIndices {
-  repeated uint64 idx = 1;
+  // For diagnostics/logging only — redundant with payload contents.
+  uint32 n_blocks = 6;
+  uint32 payload_bytes = 7;
 }

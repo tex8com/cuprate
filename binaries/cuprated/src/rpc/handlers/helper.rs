@@ -163,7 +163,7 @@ pub(super) fn hex_to_hash(hex: String) -> Result<[u8; 32], Error> {
 }
 
 /// [`cuprate_types::blockchain::BlockchainResponse::ChainHeight`] minus 1.
-pub(super) async fn top_height(state: &mut CupratedRpcHandler) -> Result<(u64, [u8; 32]), Error> {
+pub(crate) async fn top_height(state: &mut CupratedRpcHandler) -> Result<(u64, [u8; 32]), Error> {
     let (chain_height, hash) = blockchain::chain_height(&mut state.blockchain_read).await?;
     let height = chain_height.checked_sub(1).unwrap();
     Ok((height, hash))
@@ -179,7 +179,7 @@ pub const fn response_base(is_bootstrap: bool) -> ResponseBase {
 }
 
 /// TODO: impl bootstrap
-pub const fn access_response_base(is_bootstrap: bool) -> AccessResponseBase {
+pub(crate) const fn access_response_base(is_bootstrap: bool) -> AccessResponseBase {
     if is_bootstrap {
         AccessResponseBase::OK_UNTRUSTED
     } else {

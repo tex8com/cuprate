@@ -233,7 +233,7 @@ fn split_pool_info(
     }
 }
 
-async fn capped_block_complete_entries(
+pub(crate) async fn capped_block_complete_entries(
     state: &mut CupratedRpcHandler,
     response_start_height: usize,
     chain_height: usize,
@@ -302,7 +302,7 @@ fn block_response_bytes(block: &BlockCompleteEntry) -> usize {
         .saturating_add(256)
 }
 
-async fn output_indices_for_blocks(
+pub(crate) async fn output_indices_for_blocks(
     state: &mut CupratedRpcHandler,
     blocks: &[BlockCompleteEntry],
     no_miner_tx: bool,
