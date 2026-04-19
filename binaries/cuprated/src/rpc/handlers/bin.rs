@@ -8,6 +8,7 @@ use std::num::NonZero;
 use std::time::Instant;
 
 use anyhow::{anyhow, Error};
+use hex;
 use cuprate_constants::rpc::{
     GET_BLOCKS_BIN_MAX_BLOCK_COUNT, GET_BLOCKS_BIN_MAX_TX_COUNT, RESTRICTED_BLOCK_COUNT,
     RESTRICTED_TRANSACTIONS_COUNT,
@@ -85,6 +86,11 @@ async fn get_blocks(
 
     let block_hashes: Vec<[u8; 32]> = (&block_ids).into();
     drop(block_ids);
+    {
+        let first_hashes: Vec<String> = block_hashes.iter().take(3).map(|h| hex::encode(&h[..8])).collect();
+        let last_hashes: Vec<String> = block_hashes.iter().rev().take(3).map(|h| hex::encode(&h[..8])).collect();
+        eprintln!("[PERF GB] REQ start_height={} block_ids.len={} first3={:?} last3={:?}", start_height, block_hashes.len(), first_hashes, last_hashes);
+    }
 
     let Some(requested_info) = RequestedInfo::from_u8(request.requested_info) else {
         return Err(anyhow!("Wrong requested info"));
@@ -154,17 +160,24 @@ async fn get_blocks(
         max_block_count.min(GET_BLOCKS_BIN_MAX_BLOCK_COUNT)
     };
 
-    let (_, first_known_height, chain_height) =
-        blockchain::next_chain_entry(&mut state.blockchain_read, block_hashes, 1).await?;
-
-    let Some(first_known_height) = first_known_height else {
-        return Err(anyhow!("Block IDs were not sorted properly"));
+    let (first_known_height, chain_height) = if !block_hashes.is_empty() || start_height == 0 {
+        let n_hashes = block_hashes.len();
+        let (ids, fkh, ch) = blockchain::next_chain_entry(&mut state.blockchain_read, block_hashes, 1).await?;
+        eprintln!("[PERF GB] MATCH fkh={:?} chain_height={} returned_ids.len={} (from {} req-hashes)", fkh, ch, ids.len(), n_hashes);
+        (fkh, ch)
+    } else {
+        let (tip_height, _) = helper::top_height(&mut state).await?;
+        eprintln!("[PERF GB] DIRECT start_height={} tip={}", start_height, tip_height);
+        (None, usize::try_from(tip_height).unwrap() + 1)
     };
 
     let response_start_height = if start_height > 0 {
         u64_to_usize(start_height)
     } else {
-        first_known_height
+        let Some(fkh) = first_known_height else {
+            return Err(anyhow!("Block IDs were not sorted properly"));
+        };
+        fkh
     };
 
     let block_count = chain_height
@@ -371,11 +384,58 @@ async fn get_hashes(
     mut state: CupratedRpcHandler,
     request: GetHashesRequest,
 ) -> Result<GetHashesResponse, Error> {
+    use cuprate_types::Chain;
+    let t_total = Instant::now();
     eprintln!("[RPC] GetHashes: block_ids.len()={}, start_height={}", request.block_ids.len(), request.start_height);
     let GetHashesRequest {
         start_height,
         block_ids,
     } = request;
+
+    // PARALLEL FAST REFRESH: empty block_ids + start_height > 0 → bulk range lookup
+    if block_ids.len() == 0 && start_height > 0 {
+        use cuprate_types::blockchain::BlockchainReadRequest;
+        use cuprate_types::blockchain::BlockchainResponse;
+        use std::ops::Range;
+        use tower::{Service, ServiceExt};
+
+        let (tip_height, _) = blockchain::chain_height(&mut state.blockchain_read).await?;
+        if start_height >= tip_height {
+            return Ok(GetHashesResponse {
+                base: helper::access_response_base(false),
+                m_block_ids: vec![].into(),
+                current_height: tip_height,
+                start_height,
+            });
+        }
+        // 100k hashes = 3.2MB — way under 50MB content limit and 10× fewer round-trips
+        const HASH_BATCH_MAX: u64 = 100_000;
+        let count = (tip_height - start_height).min(HASH_BATCH_MAX);
+        let start = cuprate_helper::cast::u64_to_usize(start_height);
+        let end = start + cuprate_helper::cast::u64_to_usize(count);
+
+        // Single service call, server-side LMDB batch read (parallelised via rayon)
+        let BlockchainResponse::BlockHashInRange(hashes) = state
+            .blockchain_read
+            .ready()
+            .await?
+            .call(BlockchainReadRequest::BlockHashInRange(
+                (start..end) as Range<usize>,
+                Chain::Main,
+            ))
+            .await?
+        else {
+            return Err(anyhow!("unexpected blockchain response"));
+        };
+
+        eprintln!("[RPC] GetHashes DIRECT-BULK: h={} count={} actual={} total_ms={:.1}", start_height, count, hashes.len(), t_total.elapsed().as_secs_f64() * 1000.0);
+        return Ok(GetHashesResponse {
+            base: helper::access_response_base(false),
+            m_block_ids: hashes.into(),
+            current_height: tip_height,
+            start_height,
+        });
+    }
 
     // FIXME: impl `last()`
     let last = {
@@ -400,7 +460,7 @@ async fn get_hashes(
     let first_known_height =
         first_known_height.ok_or_else(|| anyhow!("Block IDs were not sorted properly"))?;
 
-    eprintln!("[RPC] GetHashes: responding with {} hashes, start_height={}", m_block_ids.len(), first_known_height);
+    eprintln!("[RPC] GetHashes: responding with {} hashes, start_height={} total_ms={:.1}", m_block_ids.len(), first_known_height, t_total.elapsed().as_secs_f64() * 1000.0);
     Ok(GetHashesResponse {
         base: helper::access_response_base(false),
         m_block_ids: m_block_ids.into(),

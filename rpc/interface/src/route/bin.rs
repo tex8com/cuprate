@@ -3,6 +3,10 @@
 //---------------------------------------------------------------------------------------------------- Import
 use axum::{body::Bytes, extract::State, http::{StatusCode, HeaderMap, header}};
 use tower::ServiceExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ACTIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 use cuprate_epee_encoding::from_bytes;
 use cuprate_rpc_types::{
@@ -19,8 +23,9 @@ use crate::rpc_handler::RpcHandler;
 //---------------------------------------------------------------------------------------------------- gzip helper
 
 /// Compress bytes with gzip if the client accepts it.
-/// Returns (body, is_compressed).
-fn maybe_gzip(data: Bytes, accept_encoding: Option<&str>) -> (Bytes, bool) {
+/// Returns (body, is_compressed, gzip_us).
+fn maybe_gzip(data: Bytes, accept_encoding: Option<&str>) -> (Bytes, bool, u128) {
+    let t0 = std::time::Instant::now();
     if let Some(ae) = accept_encoding {
         if ae.contains("gzip") && data.len() > 1024 {
             use flate2::write::GzEncoder;
@@ -31,13 +36,14 @@ fn maybe_gzip(data: Bytes, accept_encoding: Option<&str>) -> (Bytes, bool) {
             if encoder.write_all(&data).is_ok() {
                 if let Ok(compressed) = encoder.finish() {
                     if compressed.len() < data.len() {
-                        return (Bytes::from(compressed), true);
+                        let us = t0.elapsed().as_micros();
+                        return (Bytes::from(compressed), true, us);
                     }
                 }
             }
         }
     }
-    (data, false)
+    (data, false, t0.elapsed().as_micros())
 }
 
 /// Build response with optional Content-Encoding: gzip header.
@@ -62,12 +68,18 @@ macro_rules! generate_endpoints_with_input {
                 headers: HeaderMap,
                 mut request: Bytes,
             ) -> Result<axum::response::Response, StatusCode> {
-                eprintln!("[BIN RPC] {} called, request_body_size={}", stringify!($variant), request.len());
+                let _perf_total = std::time::Instant::now();
+                let _active = ACTIVE_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
+                let _reqid = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst);
+                eprintln!("[PERF RPC] {} BEGIN id={} active={} req_bytes={}", stringify!($variant), _reqid, _active, request.len());
                 let request = BinRequest::$variant(
                     from_bytes(&mut request).map_err(|e| { eprintln!("BIN RPC deserialization error: {e:?}, remaining_bytes={}", request.len()); StatusCode::INTERNAL_SERVER_ERROR })?
                 );
 
-                generate_endpoints_inner!($variant, handler, headers, request)
+                let _result = generate_endpoints_inner!($variant, handler, headers, request);
+                let _active_after = ACTIVE_REQUESTS.fetch_sub(1, Ordering::SeqCst) - 1;
+                eprintln!("[PERF RPC] {} END id={} active_remaining={} total_ms={:.1}", stringify!($variant), _reqid, _active_after, _perf_total.elapsed().as_secs_f64() * 1000.0);
+                _result
             }
         )*
     }};
@@ -108,14 +120,12 @@ macro_rules! generate_endpoints_inner {
                 match cuprate_epee_encoding::to_bytes(response) {
                     Ok(bytes) => {
                         let frozen = bytes.freeze();
+                        let uncompressed_size = frozen.len();
                         let accept_enc = $headers.get(header::ACCEPT_ENCODING)
                             .and_then(|v| v.to_str().ok());
-                        let (body, compressed) = maybe_gzip(frozen, accept_enc);
-                        if compressed {
-                            eprintln!("[BIN RPC] {} response_size={} (gzip, uncompressed={})", stringify!($variant), body.len(), body.len());
-                        } else {
-                            eprintln!("[BIN RPC] {} response_size={}", stringify!($variant), body.len());
-                        }
+                        let (body, compressed, gzip_us) = maybe_gzip(frozen, accept_enc);
+                        let ratio = if compressed && uncompressed_size > 0 { (body.len() as f64) / (uncompressed_size as f64) } else { 1.0 };
+                        eprintln!("[PERF RPC] {} uncompressed={} compressed={} gzip={} ratio={:.3} gzip_ms={:.2}", stringify!($variant), uncompressed_size, body.len(), compressed, ratio, (gzip_us as f64) / 1000.0);
                         Ok(build_response(body, compressed))
                     },
                     Err(e) => {
