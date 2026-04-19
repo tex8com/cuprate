@@ -88,6 +88,8 @@ toml_edit             = { workspace = true, features = ["parse", "display"] }
 tor-hsservice         = { workspace = true, optional = true }
 tor-persist           = { workspace = true, optional = true }
 tor-rtcompat          = { workspace = true, optional = true }
+tonic                 = { workspace = true, features = ["transport", "codegen", "prost"] }
+prost                 = { workspace = true, features = ["std", "derive"] }
 tower                 = { workspace = true, features = ["limit"] }
 tower-http            = { workspace = true, features = ["limit", "compression-gzip"] }
 tracing-appender      = { workspace = true }
@@ -101,6 +103,7 @@ pretty_assertions = { workspace = true }
 [build-dependencies]
 cuprate-hex = { workspace = true }
 serde_json  = { workspace = true, features = ["std"] }
+tonic-build = { workspace = true, features = ["prost", "transport"] }
 
 [lints]
 workspace = true

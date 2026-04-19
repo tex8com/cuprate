@@ -1,0 +1,100 @@
+// Cuprate streaming RPC for high-throughput wallet sync.
+//
+// Coexists side-by-side with the legacy bin RPC (binary epee on HTTP/1.1).
+// Standard wallets keep using bin RPC unchanged; "smart" wallets that opt
+// into this service get HTTP/2 multiplexing + server-streaming, which removes
+// the per-TCP-connection variance ceiling that limits the bin RPC to roughly
+// half of the available link bandwidth.
+//
+// Block payload format: each `BlockChunk.blocks[i]` is the same epee-serialized
+// `block_complete_entry` blob the bin RPC produces — so the wallet can reuse
+// its existing block-parser without writing a second deserializer.
+//
+// Status: experimental. Wire-compatibility is NOT promised across versions
+// until v1; pin the proto file to the cuprated commit you build against.
+
+syntax = "proto3";
+
+package cuprate.stream.v1;
+
+service BlockStream {
+  // Server-streaming RPC. The server pushes BlockChunks at the rate the
+  // backend can produce them, throttled by HTTP/2 flow control on the
+  // client side. The stream terminates when:
+  //   - stop_height (if set) is reached, OR
+  //   - tip is reached (current chain top served), OR
+  //   - the client cancels the RPC
+  //
+  // The server MUST emit BlockChunks with strictly monotonically increasing
+  // start_heights and contiguous block ranges (no gaps, no overlap). On
+  // chain-tip catch-up the server MAY pause the stream (no chunks) until
+  // a new block is available; the client should not interpret a pause as
+  // end-of-stream.
+  rpc StreamBlocks(StreamBlocksRequest) returns (stream BlockChunk);
+
+  // Future: streaming hash-only sync (replaces bin `get_hashes` for the
+  // fast_refresh phase).  Not implemented yet — wallet still uses
+  // BlockHashInRange via bin RPC for that.
+  // rpc StreamHashes(StreamHashesRequest) returns (stream HashChunk);
+}
+
+message StreamBlocksRequest {
+  // First block height to send (inclusive).
+  uint64 start_height = 1;
+
+  // Last block height to send (inclusive). 0 = stream to current tip.
+  uint64 stop_height = 2;
+
+  // If true, server prunes RCT prunable data before sending (typical wallet
+  // sync — saves ~5x bandwidth). If false, full blocks are sent.
+  bool prune = 3;
+
+  // Hint for preferred chunk size (number of blocks per BlockChunk message).
+  // Server may ignore or clamp. 0 = server default (currently 100).
+  uint32 chunk_blocks_hint = 4;
+
+  // If true, miner txs are stripped (parity with bin RPC's no_miner_tx).
+  bool no_miner_tx = 5;
+
+  // Opaque request id supplied by the client, echoed back in every chunk's
+  // PERF log entry on the server. Lets the wallet correlate its own log
+  // lines with server logs without a shared clock. Keep <= 64 chars.
+  string client_request_id = 6;
+}
+
+message BlockChunk {
+  // Height of `blocks[0]`. Subsequent blocks in this chunk are at
+  // start_height+1, start_height+2, ...
+  uint64 start_height = 1;
+
+  // Each entry is a fully epee-serialized `block_complete_entry` exactly
+  // as the bin RPC would emit it. Reuses the wallet's existing parser.
+  repeated bytes blocks = 2;
+
+  // Per-tx output indices, parallel to `blocks` and to the txs within each
+  // block. `indices[i].tx[j].idx` corresponds to the j-th tx of the i-th
+  // block in this chunk. Empty if the wallet does not need indices
+  // (currently always populated for parity with bin RPC).
+  repeated BlockOutputIndices indices = 3;
+
+  // Current chain tip height as observed by the server when this chunk was
+  // emitted. Lets the wallet update its progress bar without a separate
+  // get_info round-trip. Will increase across chunks as new blocks arrive.
+  uint64 chain_tip = 4;
+
+  // Server-side request id (auto-generated if client did not supply one).
+  // Echoed in every chunk so the client can correlate.
+  string server_request_id = 5;
+
+  // Sequence number of this chunk within the stream (0, 1, 2, ...).
+  // Useful for detecting drops/duplicates in logs.
+  uint64 chunk_seq = 6;
+}
+
+message BlockOutputIndices {
+  repeated TxOutputIndices tx = 1;
+}
+
+message TxOutputIndices {
+  repeated uint64 idx = 1;
+}

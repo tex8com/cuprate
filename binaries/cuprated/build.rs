@@ -1,5 +1,22 @@
 fn main() {
     generate_fast_sync_hashes();
+    compile_grpc_proto();
+}
+
+/// Compiles the gRPC streaming proto file into Rust bindings.
+///
+/// Output is written to `$OUT_DIR/cuprate.stream.v1.rs` and pulled into the
+/// crate via `tonic::include_proto!("cuprate.stream.v1")` from `src/rpc/grpc.rs`.
+///
+/// Requires `protoc` on PATH. macOS: `brew install protobuf`.
+/// Linux: `apt install protobuf-compiler`.
+fn compile_grpc_proto() {
+    println!("cargo::rerun-if-changed=proto/cuprate_stream.proto");
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(false)
+        .compile_protos(&["proto/cuprate_stream.proto"], &["proto"])
+        .expect("failed to compile gRPC proto — is protoc installed?");
 }
 
 /// Generates `fast_sync_hashes.rs` from `fast_sync_hashes.json`.
