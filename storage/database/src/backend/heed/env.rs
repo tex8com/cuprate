@@ -178,9 +178,13 @@ impl Env for ConcreteEnv {
         // For now:
         // - No other program using our DB exists
         // - Almost no-one has a 126+ thread CPU
+        // Raised from 126 to 512 to accommodate many concurrent wallet clients
+        // (e.g., monero-gui with 16 parallel fetch clients each opening read transactions)
+        // plus internal P2P sync readers. LMDB's ReadersFull panic would otherwise crash
+        // the entire cuprated process.
         let reader_threads = u32::try_from(config.reader_threads.get()).unwrap_or(u32::MAX);
-        env_open_options.max_readers(if reader_threads < 110 {
-            126
+        env_open_options.max_readers(if reader_threads < 496 {
+            512
         } else {
             reader_threads.saturating_add(16)
         });
