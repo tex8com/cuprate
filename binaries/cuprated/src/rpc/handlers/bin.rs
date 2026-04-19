@@ -396,7 +396,6 @@ async fn get_hashes(
     if block_ids.len() == 0 && start_height > 0 {
         use cuprate_types::blockchain::BlockchainReadRequest;
         use cuprate_types::blockchain::BlockchainResponse;
-        use std::ops::Range;
         use tower::{Service, ServiceExt};
 
         let (tip_height, _) = blockchain::chain_height(&mut state.blockchain_read).await?;
@@ -411,8 +410,8 @@ async fn get_hashes(
         // 100k hashes = 3.2MB — way under 50MB content limit and 10× fewer round-trips
         const HASH_BATCH_MAX: u64 = 100_000;
         let count = (tip_height - start_height).min(HASH_BATCH_MAX);
-        let start = cuprate_helper::cast::u64_to_usize(start_height);
-        let end = start + cuprate_helper::cast::u64_to_usize(count);
+        let start = u64_to_usize(start_height);
+        let end = start + u64_to_usize(count);
 
         // Single service call, server-side LMDB batch read (parallelised via rayon)
         let BlockchainResponse::BlockHashInRange(hashes) = state
@@ -420,7 +419,7 @@ async fn get_hashes(
             .ready()
             .await?
             .call(BlockchainReadRequest::BlockHashInRange(
-                (start..end) as Range<usize>,
+                start..end,
                 Chain::Main,
             ))
             .await?
