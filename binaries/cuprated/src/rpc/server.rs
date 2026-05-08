@@ -131,7 +131,10 @@ pub fn init_rpc_servers(
 ///
 /// The function only returns when the server itself returns or an error
 /// occurs. Coexists with the bin RPC axum server on a separate port.
-async fn run_grpc_server(rpc_handler: CupratedRpcHandler, address: SocketAddr) -> Result<(), Error> {
+async fn run_grpc_server(
+    rpc_handler: CupratedRpcHandler,
+    address: SocketAddr,
+) -> Result<(), Error> {
     use tonic::transport::Server;
 
     eprintln!("[GRPC] Starting BlockStream server at {address}");
@@ -140,6 +143,8 @@ async fn run_grpc_server(rpc_handler: CupratedRpcHandler, address: SocketAddr) -
     let svc = grpc::block_stream_service(rpc_handler);
 
     Server::builder()
+        .initial_stream_window_size(Some(grpc::GRPC_HTTP2_STREAM_WINDOW_BYTES))
+        .initial_connection_window_size(Some(grpc::GRPC_HTTP2_CONNECTION_WINDOW_BYTES))
         .add_service(svc)
         .serve(address)
         .await
@@ -192,8 +197,14 @@ async fn run_rpc_server(
         .bin_get_output_distribution()
         .fallback()
         .build()
-        .route("/get_info", axum::routing::any(get_info_proxy::<CupratedRpcHandler>))
-        .route("/getinfo", axum::routing::any(get_info_proxy::<CupratedRpcHandler>))
+        .route(
+            "/get_info",
+            axum::routing::any(get_info_proxy::<CupratedRpcHandler>),
+        )
+        .route(
+            "/getinfo",
+            axum::routing::any(get_info_proxy::<CupratedRpcHandler>),
+        )
         .with_state(rpc_handler);
 
     // Add restrictive layers if restricted RPC.
@@ -214,39 +225,35 @@ async fn run_rpc_server(
     Ok(())
 }
 
-
 /// Proxy /get_info to the JSON-RPC get_info handler.
 /// The Monero wallet calls this endpoint directly (not via /json_rpc).
 async fn get_info_proxy<H: cuprate_rpc_interface::RpcHandler>(
     axum::extract::State(handler): axum::extract::State<H>,
 ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
-    use tower::ServiceExt;
     use cuprate_rpc_types::json::{JsonRpcRequest, JsonRpcResponse};
-    
+    use tower::ServiceExt;
+
     eprintln!("[RPC] /get_info endpoint called");
-    
+
     let request = JsonRpcRequest::GetInfo(Default::default());
-    
-    let response = handler
-        .oneshot(request)
-        .await
-        .map_err(|e| {
-            eprintln!("[RPC] /get_info handler error: {e:?}");
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
+
+    let response = handler.oneshot(request).await.map_err(|e| {
+        eprintln!("[RPC] /get_info handler error: {e:?}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let JsonRpcResponse::GetInfo(info) = response else {
         eprintln!("[RPC] /get_info wrong response variant");
         return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     };
-    
+
     eprintln!("[RPC] /get_info success, height={}", info.height);
-    
+
     // Serialize the response as JSON - the wallet expects a flat JSON object
     let json = serde_json::to_value(&info).map_err(|e| {
         eprintln!("[RPC] /get_info serialize error: {e:?}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     Ok(axum::Json(json))
 }

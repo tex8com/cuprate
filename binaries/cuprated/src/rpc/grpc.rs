@@ -60,7 +60,7 @@ use crate::rpc::{
     clippy::suspicious,
     clippy::restriction,
     missing_docs,
-    unused_qualifications,
+    unused_qualifications
 )]
 pub mod proto {
     tonic::include_proto!("cuprate.stream.v1");
@@ -71,13 +71,17 @@ use proto::{BlockChunk, StreamBlocksRequest};
 
 const DEFAULT_CHUNK_BLOCKS: usize = 200;
 const MIN_CHUNK_BLOCKS: usize = 16;
-const MAX_CHUNK_BLOCKS: usize = 2000;
+const MAX_CHUNK_BLOCKS: usize = 10000;
+const MAX_GRPC_CHUNK_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_GRPC_CHUNK_TX_COUNT: usize = 1_000_000;
+pub const MAX_GRPC_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+pub const GRPC_HTTP2_STREAM_WINDOW_BYTES: u32 = 512 * 1024 * 1024;
+pub const GRPC_HTTP2_CONNECTION_WINDOW_BYTES: u32 = 512 * 1024 * 1024;
 
 /// mpsc capacity between producer task and HTTP/2 send loop. Small on
-/// purpose: a full buffer means the client is not draining and we want to
-/// surface that as backpressure (visible in send_ms / bp_ratio in PERF logs)
-/// instead of buffering chunks in memory.
-const CHANNEL_CAPACITY: usize = 2;
+/// purpose in production, but high-throughput wallet restore tests need enough
+/// room to absorb scanner stalls without immediately stalling HTTP/2.
+const CHANNEL_CAPACITY: usize = 32;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
@@ -125,9 +129,10 @@ impl BlockStream for BlockStreamService {
             .unwrap_or(0);
 
         eprintln!(
-            "[GRPC StreamBlocks] OPEN id={} client_req_id={} start={} stop={} prune={} no_miner_tx={} chunk_blocks={} active_streams={} open_epoch_ms={}",
+            "[GRPC StreamBlocks] OPEN id={} client_req_id={} start={} stop={} prune={} no_miner_tx={} chunk_blocks={} max_chunk_bytes={} max_chunk_txs={} active_streams={} open_epoch_ms={}",
             server_req_id, client_id_label, start_height, stop_height, prune, no_miner_tx,
-            chunk_blocks, active, open_epoch_ms,
+            chunk_blocks, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT, active,
+            open_epoch_ms,
         );
 
         let (tx, rx) = mpsc::channel::<Result<BlockChunk, Status>>(CHANNEL_CAPACITY);
@@ -208,6 +213,8 @@ async fn produce_block_stream(
             chain_height,
             want,
             prune,
+            MAX_GRPC_CHUNK_RESPONSE_BYTES,
+            MAX_GRPC_CHUNK_TX_COUNT,
         )
         .await?;
         let db_ms = t_db.elapsed().as_secs_f64() * 1000.0;
@@ -314,4 +321,6 @@ async fn produce_block_stream(
 /// Build the tonic gRPC service ready to be added to a tonic Server.
 pub fn block_stream_service(handler: CupratedRpcHandler) -> BlockStreamServer<BlockStreamService> {
     BlockStreamServer::new(BlockStreamService { handler })
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }

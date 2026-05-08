@@ -60,6 +60,7 @@ message StreamBlocksRequest {
 
   // Hint for preferred chunk size (number of blocks per BlockChunk).
   // Server may ignore or clamp. 0 = server default (currently 200).
+  // This fork currently allows up to 10000 for high-throughput restore tests.
   uint32 chunk_blocks_hint = 4;
 
   // If true, miner txs are stripped (parity with bin RPC's no_miner_tx).
