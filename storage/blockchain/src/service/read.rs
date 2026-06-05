@@ -12,6 +12,7 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
+    io,
     ops::Range,
     sync::Arc,
 };
@@ -30,7 +31,7 @@ use cuprate_helper::map::combine_low_high_bits_to_u128;
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
     output_cache::OutputCache,
-    rpc::OutputHistogramInput,
+    rpc::{OutputDistributionData, OutputHistogramInput},
     Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, TxsInBlock,
 };
 
@@ -42,8 +43,9 @@ use crate::{
         },
         block::{
             block_exists, get_block, get_block_blob_with_tx_indexes, get_block_by_hash,
-            get_block_complete_entry, get_block_complete_entry_from_height, get_block_complete_entry_from_height_pruned,
-            get_block_extended_header_from_height, get_block_height, get_block_info,
+            get_block_complete_entry, get_block_complete_entry_from_height,
+            get_block_complete_entry_from_height_pruned, get_block_extended_header_from_height,
+            get_block_height, get_block_info,
         },
         blockchain::{cumulative_generated_coins, find_split_point, top_block_height},
         key_image::key_image_exists,
@@ -112,7 +114,9 @@ fn map_request(
     match request {
         R::BlockCompleteEntries(block_hashes) => block_complete_entries(env, block_hashes),
         R::BlockCompleteEntriesByHeight(heights) => block_complete_entries_by_height(env, heights),
-        R::BlockCompleteEntriesByHeightPruned(heights) => block_complete_entries_by_height_pruned(env, heights),
+        R::BlockCompleteEntriesByHeightPruned(heights) => {
+            block_complete_entries_by_height_pruned(env, heights)
+        }
         R::BlockExtendedHeader(block) => block_extended_header(env, block),
         R::BlockHash(block, chain) => block_hash(env, block, chain),
         R::BlockHashInRange(blocks, chain) => block_hash_in_range(env, blocks, chain),
@@ -1021,5 +1025,95 @@ fn tx_output_indexes_batch(env: &ConcreteEnv, tx_hashes: Vec<[u8; 32]>) -> Respo
 }
 
 fn output_distribution(env: &ConcreteEnv, input: OutputDistributionInput) -> ResponseResult {
-    Ok(BlockchainResponse::OutputDistribution(todo!()))
+    let env_inner = env.env_inner();
+    let tx_ro = env_inner.tx_ro()?;
+    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
+    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+
+    let top_height = top_block_height(&table_block_heights)?;
+    let top_height_u64 = u64::try_from(top_height)
+        .map_err(|_| invalid_distribution_request("chain height does not fit into u64"))?;
+    let to_height_u64 = input
+        .to_height
+        .map_or(top_height_u64, |height| height.get());
+
+    if to_height_u64 < input.from_height {
+        return Err(invalid_distribution_request(
+            "output distribution to_height is below from_height",
+        ));
+    }
+
+    if input.from_height > top_height_u64 || to_height_u64 > top_height_u64 {
+        return Err(invalid_distribution_request(
+            "output distribution height is above the chain tip",
+        ));
+    }
+
+    let from_height = usize::try_from(input.from_height)
+        .map_err(|_| invalid_distribution_request("from_height does not fit into usize"))?;
+    let to_height = usize::try_from(to_height_u64)
+        .map_err(|_| invalid_distribution_request("to_height does not fit into usize"))?;
+
+    let rct_base = if from_height == 0 {
+        0
+    } else {
+        table_block_infos
+            .get(&(from_height - 1))?
+            .cumulative_rct_outs
+    };
+
+    let cumulative_rct_distribution = (from_height..=to_height)
+        .map(|height| {
+            table_block_infos
+                .get(&height)
+                .map(|block_info| block_info.cumulative_rct_outs)
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+
+    let distributions = input
+        .amounts
+        .into_iter()
+        .map(|amount| {
+            let (distribution, base) = if amount == 0 {
+                let distribution = if input.cumulative {
+                    cumulative_rct_distribution.clone()
+                } else {
+                    non_cumulative_distribution(&cumulative_rct_distribution, rct_base)
+                };
+
+                (distribution, rct_base)
+            } else {
+                // Pre-RCT per-amount output distributions are not indexed yet.
+                // Return a valid all-zero shape instead of panicking the daemon.
+                (vec![0; cumulative_rct_distribution.len()], 0)
+            };
+
+            OutputDistributionData {
+                amount,
+                distribution,
+                start_height: input.from_height,
+                base,
+            }
+        })
+        .collect();
+
+    Ok(BlockchainResponse::OutputDistribution(distributions))
+}
+
+fn non_cumulative_distribution(cumulative_distribution: &[u64], base: u64) -> Vec<u64> {
+    let mut distribution = cumulative_distribution.to_vec();
+
+    for index in (1..distribution.len()).rev() {
+        distribution[index] = distribution[index].saturating_sub(distribution[index - 1]);
+    }
+
+    if let Some(first) = distribution.first_mut() {
+        *first = first.saturating_sub(base);
+    }
+
+    distribution
+}
+
+fn invalid_distribution_request(message: &'static str) -> RuntimeError {
+    RuntimeError::Io(io::Error::new(io::ErrorKind::InvalidInput, message))
 }

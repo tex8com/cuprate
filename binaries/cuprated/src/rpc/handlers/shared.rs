@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Error};
-use cuprate_types::OutputDistributionInput;
+use cuprate_types::{rpc::OutputDistributionData, OutputDistributionInput};
 use monero_oxide::transaction::Timelock;
 
 use cuprate_constants::rpc::MAX_RESTRICTED_GLOBAL_FAKE_OUTS_COUNT;
@@ -23,7 +23,7 @@ use cuprate_rpc_types::{
         GetTransactionPoolHashesResponse,
     },
     json::{GetOutputDistributionRequest, GetOutputDistributionResponse},
-    misc::{Distribution, OutKeyBin},
+    misc::{Distribution, DistributionCompressedBinary, DistributionUncompressed, OutKeyBin},
 };
 
 use crate::rpc::{
@@ -119,14 +119,48 @@ pub(super) async fn get_output_distribution(
         to_height: NonZero::new(request.to_height),
     };
 
-    let distributions = blockchain::output_distribution(&mut state.blockchain_read, input).await?;
+    let distributions = blockchain::output_distribution(&mut state.blockchain_read, input)
+        .await?
+        .into_iter()
+        .map(|distribution| {
+            output_distribution_data_to_rpc(distribution, request.binary, request.compress)
+        })
+        .collect();
 
     Ok(GetOutputDistributionResponse {
         base: helper::access_response_base(false),
-        distributions: todo!(
-            "This type contains binary strings: <https://github.com/monero-project/monero/issues/9422>"
-        ),
+        distributions,
     })
+}
+
+fn output_distribution_data_to_rpc(
+    data: OutputDistributionData,
+    binary: bool,
+    compress: bool,
+) -> Distribution {
+    let OutputDistributionData {
+        amount,
+        distribution,
+        start_height,
+        base,
+    } = data;
+
+    if compress {
+        Distribution::CompressedBinary(DistributionCompressedBinary {
+            start_height,
+            base,
+            distribution,
+            amount,
+        })
+    } else {
+        Distribution::Uncompressed(DistributionUncompressed {
+            start_height,
+            base,
+            distribution,
+            amount,
+            binary,
+        })
+    }
 }
 
 /// Always returns an [`Error`].

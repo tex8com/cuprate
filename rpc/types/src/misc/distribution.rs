@@ -21,8 +21,14 @@ use cuprate_epee_encoding::{
     45..=55
 )]
 #[cfg(any(feature = "epee", feature = "serde"))]
-fn compress_integer_array(_: &[u64]) -> Vec<u8> {
-    todo!()
+fn compress_integer_array(values: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 8);
+
+    for value in values {
+        write_monero_varint(*value, &mut bytes);
+    }
+
+    bytes
 }
 
 /// TODO: <https://github.com/Cuprate/cuprate/pull/229#discussion_r1690531904>.
@@ -34,8 +40,56 @@ fn compress_integer_array(_: &[u64]) -> Vec<u8> {
     57..=72
 )]
 #[cfg(any(feature = "epee", feature = "serde"))]
-fn decompress_integer_array(_: &[u8]) -> Vec<u64> {
-    todo!()
+fn decompress_integer_array(bytes: &[u8]) -> Vec<u64> {
+    let mut values = Vec::with_capacity(bytes.len());
+    let mut cursor = bytes;
+
+    while !cursor.is_empty() {
+        let Some(value) = read_monero_varint(&mut cursor) else {
+            break;
+        };
+
+        values.push(value);
+    }
+
+    values
+}
+
+#[cfg(any(feature = "epee", feature = "serde"))]
+fn write_monero_varint(value: u64, bytes: &mut Vec<u8>) {
+    const SIZE_OF_SIZE_MARKER: u32 = 2;
+    const FITS_IN_ONE_BYTE: u64 = 2_u64.pow(8 - SIZE_OF_SIZE_MARKER) - 1;
+    const FITS_IN_TWO_BYTES: u64 = 2_u64.pow(16 - SIZE_OF_SIZE_MARKER) - 1;
+    const FITS_IN_FOUR_BYTES: u64 = 2_u64.pow(32 - SIZE_OF_SIZE_MARKER) - 1;
+
+    let size_marker = match value {
+        0..=FITS_IN_ONE_BYTE => 0,
+        64..=FITS_IN_TWO_BYTES => 1,
+        16_384..=FITS_IN_FOUR_BYTES => 2,
+        _ => 3,
+    };
+
+    let tagged = (value << SIZE_OF_SIZE_MARKER) | size_marker;
+    bytes.extend_from_slice(&tagged.to_le_bytes()[..1 << size_marker]);
+}
+
+#[cfg(any(feature = "epee", feature = "serde"))]
+fn read_monero_varint(bytes: &mut &[u8]) -> Option<u64> {
+    let first = *bytes.first()?;
+    let len = 1usize << (first & 0b11);
+
+    if bytes.len() < len {
+        return None;
+    }
+
+    let mut value = u64::from(first >> 2);
+
+    for (index, byte) in bytes[1..len].iter().enumerate() {
+        value |= u64::from(*byte) << ((index * 8) + 6);
+    }
+
+    *bytes = &bytes[len..];
+    Some(value)
 }
 
 //---------------------------------------------------------------------------------------------------- Distribution
@@ -271,29 +325,27 @@ impl EpeeObject for Distribution {
 //---------------------------------------------------------------------------------------------------- Tests
 #[cfg(test)]
 mod tests {
-    // use pretty_assertions::assert_eq;
+    use pretty_assertions::assert_eq;
 
-    // use super::*;
+    use super::*;
 
-    // TODO: re-enable tests after (de)compression functions are implemented.
+    /// Tests that [`compress_integer_array`] outputs as expected.
+    #[test]
+    fn compress() {
+        let varints = &[16_384, 16_383, 16_382, 16_381];
+        let bytes = compress_integer_array(varints);
 
-    // /// Tests that [`compress_integer_array`] outputs as expected.
-    // #[test]
-    // fn compress() {
-    //     let varints = &[16_384, 16_383, 16_382, 16_381];
-    //     let bytes = compress_integer_array(varints).unwrap();
+        let expected = vec![2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
+        assert_eq!(expected, bytes);
+    }
 
-    //     let expected = [2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
-    //     assert_eq!(expected, *bytes);
-    // }
+    /// Tests that [`decompress_integer_array`] outputs as expected.
+    #[test]
+    fn decompress() {
+        let bytes = &[2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
+        let varints = decompress_integer_array(bytes);
 
-    // /// Tests that [`decompress_integer_array`] outputs as expected.
-    // #[test]
-    // fn decompress() {
-    //     let bytes = &[2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
-    //     let varints = decompress_integer_array(bytes);
-
-    //     let expected = vec![16_384, 16_383, 16_382, 16_381];
-    //     assert_eq!(expected, varints);
-    // }
+        let expected = vec![16_384, 16_383, 16_382, 16_381];
+        assert_eq!(expected, varints);
+    }
 }

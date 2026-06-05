@@ -17,7 +17,7 @@ use cuprate_database::{ConcreteEnv, DatabaseIter, DatabaseRo, Env, EnvInner, Run
 use cuprate_test_utils::data::{BLOCK_V16_TX0, BLOCK_V1_TX2, BLOCK_V9_TX3};
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse, BlockchainWriteRequest},
-    Chain, ChainId, OutputOnChain, VerifiedBlockInformation,
+    Chain, ChainId, OutputDistributionInput, OutputOnChain, VerifiedBlockInformation,
 };
 
 use crate::{
@@ -332,6 +332,83 @@ async fn test_template(
 #[test]
 fn init_drop() {
     let (_reader, _writer, _env, _tempdir) = init_service();
+}
+
+#[tokio::test]
+async fn rct_output_distribution() {
+    let (reader, mut writer, _env, _tempdir) = init_service();
+
+    for (height, block) in [&*BLOCK_V1_TX2, &*BLOCK_V9_TX3, &*BLOCK_V16_TX0]
+        .into_iter()
+        .enumerate()
+    {
+        let mut block = block.clone();
+        block.height = height;
+
+        let response = writer
+            .call(BlockchainWriteRequest::WriteBlock(block))
+            .await
+            .unwrap();
+        assert_eq!(response, BlockchainResponse::Ok);
+    }
+
+    let cumulative = reader
+        .clone()
+        .oneshot(BlockchainReadRequest::OutputDistribution(
+            OutputDistributionInput {
+                amounts: vec![0],
+                cumulative: true,
+                from_height: 0,
+                to_height: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let BlockchainResponse::OutputDistribution(distributions) = cumulative else {
+        panic!("{cumulative:#?}");
+    };
+    assert_eq!(distributions.len(), 1);
+    assert_eq!(distributions[0].amount, 0);
+    assert_eq!(distributions[0].base, 0);
+    assert_eq!(distributions[0].start_height, 0);
+    assert_eq!(distributions[0].distribution, vec![0, 7, 8]);
+
+    let non_cumulative = reader
+        .clone()
+        .oneshot(BlockchainReadRequest::OutputDistribution(
+            OutputDistributionInput {
+                amounts: vec![0],
+                cumulative: false,
+                from_height: 0,
+                to_height: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let BlockchainResponse::OutputDistribution(distributions) = non_cumulative else {
+        panic!("{non_cumulative:#?}");
+    };
+    assert_eq!(distributions[0].distribution, vec![0, 7, 1]);
+
+    let partial = reader
+        .oneshot(BlockchainReadRequest::OutputDistribution(
+            OutputDistributionInput {
+                amounts: vec![0],
+                cumulative: true,
+                from_height: 2,
+                to_height: std::num::NonZero::new(2),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let BlockchainResponse::OutputDistribution(distributions) = partial else {
+        panic!("{partial:#?}");
+    };
+    assert_eq!(distributions[0].base, 7);
+    assert_eq!(distributions[0].distribution, vec![8]);
 }
 
 /// Assert write/read correctness of [`block_v1_tx2`].
