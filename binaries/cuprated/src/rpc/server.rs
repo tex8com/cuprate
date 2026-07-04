@@ -182,6 +182,7 @@ async fn run_rpc_server(
         .other_sendrawtransaction()
         .other_get_transaction_pool()
         .other_get_transaction_pool_hashes()
+        .other_get_transaction_pool_stats()
         .other_get_outs()
         .other_get_peer_list()
         .other_get_net_stats()

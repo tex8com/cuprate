@@ -383,7 +383,16 @@ async fn send_raw_transaction(
         tx_extra_too_big: false,
     };
 
-    let tx = Transaction::read(&mut request.tx_as_hex.as_slice())?;
+    let tx = match Transaction::read(&mut request.tx_as_hex.as_slice()) {
+        Ok(tx) => tx,
+        Err(e) => {
+            resp.base.response_base.status = Status::Failed;
+            resp.invalid_input = true;
+            resp.not_relayed = true;
+            resp.reason = format!("Failed to parse transaction: {e}");
+            return Ok(resp);
+        }
+    };
 
     if request.do_sanity_checks {
         /// FIXME: these checks could be defined elsewhere.
@@ -464,7 +473,10 @@ async fn send_raw_transaction(
         // > making nodes hold txs in their pool that don't get passed
         // > around the network can cause issues, like targeted tx pool double spends
         // > there is also no reason to have this for public RPC
-        return Err(anyhow!("do_not_relay is not supported on restricted RPC"));
+        resp.base.response_base.status = Status::Failed;
+        resp.not_relayed = true;
+        resp.reason = "do_not_relay is not supported on restricted RPC".to_string();
+        return Ok(resp);
     }
 
     let txs = vec![tx.serialize().into()];
@@ -482,6 +494,7 @@ async fn send_raw_transaction(
         return Ok(resp);
     }
 
+    resp.base.response_base.status = Status::Failed;
     resp.not_relayed = true;
 
     // <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L124>
@@ -514,6 +527,7 @@ async fn send_raw_transaction(
             add_reason(&mut reasons, reason);
         }
     }
+    resp.reason = reasons;
 
     Ok(resp)
 }
