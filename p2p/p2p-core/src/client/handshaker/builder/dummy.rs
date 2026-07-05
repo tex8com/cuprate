@@ -11,6 +11,7 @@ use crate::{
     services::{
         AddressBookRequest, AddressBookResponse, CoreSyncDataRequest, CoreSyncDataResponse,
     },
+    types::Peerlist,
     NetworkZone, ProtocolRequest, ProtocolResponse,
 };
 
@@ -108,14 +109,20 @@ impl<N: NetworkZone> Service<AddressBookRequest<N>> for DummyAddressBook {
                 unban_instant: None,
             },
             AddressBookRequest::OwnAddress => AddressBookResponse::OwnAddress(None),
-            AddressBookRequest::Peerlist
-            | AddressBookRequest::PeerlistSize
-            | AddressBookRequest::ConnectionCount
-            | AddressBookRequest::SetBan(_)
-            | AddressBookRequest::GetBans
-            | AddressBookRequest::ConnectionInfo => {
-                todo!("finish https://github.com/Cuprate/cuprate/pull/297")
+            AddressBookRequest::Peerlist => AddressBookResponse::Peerlist(Peerlist {
+                white: Vec::new(),
+                grey: Vec::new(),
+            }),
+            AddressBookRequest::PeerlistSize => {
+                AddressBookResponse::PeerlistSize { white: 0, grey: 0 }
             }
+            AddressBookRequest::ConnectionCount => AddressBookResponse::ConnectionCount {
+                incoming: 0,
+                outgoing: 0,
+            },
+            AddressBookRequest::SetBan(_) => AddressBookResponse::Ok,
+            AddressBookRequest::GetBans => AddressBookResponse::GetBans(Vec::new()),
+            AddressBookRequest::ConnectionInfo => AddressBookResponse::ConnectionInfo(Vec::new()),
         }))
     }
 }

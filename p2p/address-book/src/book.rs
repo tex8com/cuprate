@@ -23,6 +23,7 @@ use cuprate_p2p_core::{
     client::InternalPeerID,
     handles::ConnectionHandle,
     services::{AddressBookRequest, AddressBookResponse, ZoneSpecificPeerListEntryBase},
+    types::Peerlist,
     NetZoneAddress, NetworkZone,
 };
 use cuprate_pruning::PruningSeed;
@@ -420,13 +421,29 @@ impl<Z: BorshNetworkZone> Service<AddressBookRequest<Z>> for AddressBook<Z> {
             AddressBookRequest::OwnAddress => {
                 Ok(AddressBookResponse::OwnAddress(self.cfg.our_own_address))
             }
-            AddressBookRequest::Peerlist
-            | AddressBookRequest::PeerlistSize
-            | AddressBookRequest::ConnectionCount
-            | AddressBookRequest::SetBan(_)
-            | AddressBookRequest::GetBans
-            | AddressBookRequest::ConnectionInfo => {
-                todo!("finish https://github.com/Cuprate/cuprate/pull/297")
+            AddressBookRequest::Peerlist => Ok(AddressBookResponse::Peerlist(Peerlist {
+                white: self.white_list.peers.values().copied().collect(),
+                grey: self.gray_list.peers.values().copied().collect(),
+            })),
+            AddressBookRequest::PeerlistSize => Ok(AddressBookResponse::PeerlistSize {
+                white: self.white_list.len(),
+                grey: self.gray_list.len(),
+            }),
+            AddressBookRequest::ConnectionCount => Ok(AddressBookResponse::ConnectionCount {
+                incoming: 0,
+                outgoing: self.connected_peers.len(),
+            }),
+            AddressBookRequest::SetBan(set_ban) => {
+                if let Some(duration) = set_ban.ban {
+                    self.ban_peer(set_ban.address, duration);
+                } else {
+                    self.banned_peers.remove(&set_ban.address.ban_id());
+                }
+                Ok(AddressBookResponse::Ok)
+            }
+            AddressBookRequest::GetBans => Ok(AddressBookResponse::GetBans(Vec::new())),
+            AddressBookRequest::ConnectionInfo => {
+                Ok(AddressBookResponse::ConnectionInfo(Vec::new()))
             }
         };
 
