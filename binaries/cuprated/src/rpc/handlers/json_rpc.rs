@@ -114,7 +114,12 @@ pub async fn map_request(
         }
         Req::RelayTx(r) => Resp::RelayTx(not_available()?),
         Req::SyncInfo(r) => Resp::SyncInfo(sync_info(state, r).await?),
-        Req::GetTransactionPoolBacklog(r) => Resp::GetTransactionPoolBacklog(not_available()?),
+        Req::GetTransactionPoolBacklog(r) => {
+            Resp::GetTransactionPoolBacklog(get_transaction_pool_backlog(state, r).await?)
+        }
+        Req::GetOutputDistribution(r) => {
+            Resp::GetOutputDistribution(get_output_distribution(state, r).await?)
+        }
         Req::GetMinerData(r) => Resp::GetMinerData(not_available()?),
         Req::PruneBlockchain(r) => Resp::PruneBlockchain(not_available()?),
         Req::CalcPow(r) => Resp::CalcPow(not_available()?),

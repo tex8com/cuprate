@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use cuprate_epee_encoding::{
     epee_object, error,
     macros::bytes::{Buf, BufMut},
-    read_epee_value, write_field, EpeeObject, EpeeObjectBuilder, EpeeValue,
+    read_epee_value, write_field, EpeeObject, EpeeObjectBuilder,
 };
 
 //---------------------------------------------------------------------------------------------------- Free
@@ -308,11 +308,10 @@ impl EpeeObject for Distribution {
             }) => {
                 let compressed_data = compress_integer_array(&distribution);
 
-                start_height.write(w)?;
-                base.write(w)?;
-                compressed_data.write(w)?;
-                amount.write(w)?;
-
+                write_field(start_height, "start_height", w)?;
+                write_field(base, "base", w)?;
+                write_field(compressed_data, "compressed_data", w)?;
+                write_field(amount, "amount", w)?;
                 write_field(true, "binary", w)?;
                 write_field(true, "compress", w)?;
             }
@@ -347,5 +346,33 @@ mod tests {
 
         let expected = vec![16_384, 16_383, 16_382, 16_381];
         assert_eq!(expected, varints);
+    }
+
+    #[cfg(feature = "epee")]
+    #[test]
+    fn compressed_binary_epee_roundtrip() {
+        use crate::{base::AccessResponseBase, json::GetOutputDistributionResponse};
+
+        let response = GetOutputDistributionResponse {
+            base: AccessResponseBase::OK,
+            distributions: vec![Distribution::CompressedBinary(
+                DistributionCompressedBinary {
+                    start_height: 1,
+                    base: 2,
+                    distribution: vec![16_384, 16_383, 16_382, 16_381],
+                    amount: 0,
+                },
+            )],
+        };
+
+        let bytes = cuprate_epee_encoding::to_bytes(response.clone()).unwrap();
+        assert!(bytes
+            .as_ref()
+            .windows("compressed_data".len())
+            .any(|window| window == b"compressed_data"));
+
+        let mut bytes = bytes.freeze();
+        let decoded = cuprate_epee_encoding::from_bytes(&mut bytes).unwrap();
+        assert_eq!(response, decoded);
     }
 }

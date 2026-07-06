@@ -766,6 +766,7 @@ pub enum JsonRpcRequest {
     RelayTx(RelayTxRequest),
     SyncInfo(SyncInfoRequest),
     GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest),
+    GetOutputDistribution(GetOutputDistributionRequest),
     GetMinerData(GetMinerDataRequest),
     PruneBlockchain(PruneBlockchainRequest),
     CalcPow(CalcPowRequest),
@@ -792,6 +793,7 @@ impl RpcCallValue for JsonRpcRequest {
             Self::GetVersion(x) => x.is_restricted(),
             Self::GetFeeEstimate(x) => x.is_restricted(),
             Self::GetTransactionPoolBacklog(x) => x.is_restricted(),
+            Self::GetOutputDistribution(x) => x.is_restricted(),
             Self::GetMinerData(x) => x.is_restricted(),
             Self::AddAuxPow(x) => x.is_restricted(),
             Self::GetTxIdsLoose(x) => x.is_restricted(),
@@ -828,6 +830,7 @@ impl RpcCallValue for JsonRpcRequest {
             Self::GetVersion(x) => x.is_empty(),
             Self::GetFeeEstimate(x) => x.is_empty(),
             Self::GetTransactionPoolBacklog(x) => x.is_empty(),
+            Self::GetOutputDistribution(x) => x.is_empty(),
             Self::GetMinerData(x) => x.is_empty(),
             Self::AddAuxPow(x) => x.is_empty(),
             Self::GetTxIdsLoose(x) => x.is_empty(),
@@ -901,6 +904,7 @@ pub enum JsonRpcResponse {
     RelayTx(RelayTxResponse),
     SyncInfo(SyncInfoResponse),
     GetTransactionPoolBacklog(GetTransactionPoolBacklogResponse),
+    GetOutputDistribution(GetOutputDistributionResponse),
     GetMinerData(GetMinerDataResponse),
     PruneBlockchain(PruneBlockchainResponse),
     CalcPow(CalcPowResponse),
@@ -1826,6 +1830,26 @@ mod test {
                 cumulative: false,
                 to_height: 0,
             },
+        );
+    }
+
+    #[test]
+    fn get_output_distribution_json_rpc_request() {
+        let request = from_str::<JsonRpcRequest>(json::GET_OUTPUT_DISTRIBUTION_REQUEST).unwrap();
+        let JsonRpcRequest::GetOutputDistribution(request) = request else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            request,
+            GetOutputDistributionRequest {
+                amounts: vec![628780000],
+                from_height: 1462078,
+                binary: true,
+                compress: false,
+                cumulative: false,
+                to_height: 0,
+            }
         );
     }
 
