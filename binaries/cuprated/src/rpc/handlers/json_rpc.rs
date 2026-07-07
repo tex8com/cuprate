@@ -360,8 +360,8 @@ async fn get_block_headers_range(
 ) -> Result<GetBlockHeadersRangeResponse, Error> {
     let (top_height, _) = helper::top_height(&mut state).await?;
 
-    if request.start_height >= top_height
-        || request.end_height >= top_height
+    if request.start_height > top_height
+        || request.end_height > top_height
         || request.start_height > request.end_height
     {
         return Err(anyhow!("Invalid start/end heights"));
