@@ -48,8 +48,9 @@ use cuprate_rpc_types::{
         GetTxIdsLooseResponse, GetVersionRequest, GetVersionResponse, HardForkInfoRequest,
         HardForkInfoResponse, JsonRpcRequest, JsonRpcResponse, OnGetBlockHashRequest,
         OnGetBlockHashResponse, PruneBlockchainRequest, PruneBlockchainResponse, RelayTxRequest,
-        RelayTxResponse, SetBansRequest, SetBansResponse, SubmitBlockRequest, SubmitBlockResponse,
-        SyncInfoRequest, SyncInfoResponse,
+        RelayTxResponse, RpcAccessInfoRequest, RpcAccessInfoResponse, SetBansRequest,
+        SetBansResponse, SubmitBlockRequest, SubmitBlockResponse, SyncInfoRequest,
+        SyncInfoResponse,
     },
     misc::{BlockHeader, ChainInfo, Distribution, GetBan, HistogramEntry, Status, SyncInfoPeer},
     CORE_RPC_VERSION,
@@ -120,6 +121,7 @@ pub async fn map_request(
         Req::GetOutputDistribution(r) => {
             Resp::GetOutputDistribution(get_output_distribution(state, r).await?)
         }
+        Req::RpcAccessInfo(r) => Resp::RpcAccessInfo(rpc_access_info(state, r).await?),
         Req::GetMinerData(r) => Resp::GetMinerData(not_available()?),
         Req::PruneBlockchain(r) => Resp::PruneBlockchain(not_available()?),
         Req::CalcPow(r) => Resp::CalcPow(not_available()?),
@@ -935,6 +937,24 @@ async fn get_output_distribution(
     request: GetOutputDistributionRequest,
 ) -> Result<GetOutputDistributionResponse, Error> {
     shared::get_output_distribution(state, request).await
+}
+
+/// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L3459-L3530>
+async fn rpc_access_info(
+    _: CupratedRpcHandler,
+    _: RpcAccessInfoRequest,
+) -> Result<RpcAccessInfoResponse, Error> {
+    Ok(RpcAccessInfoResponse {
+        base: AccessResponseBase::OK,
+        hashing_blob: String::new(),
+        seed_height: 0,
+        seed_hash: String::new(),
+        next_seed_hash: String::new(),
+        cookie: 0,
+        diff: 0,
+        credits_per_hash_found: 0,
+        height: 0,
+    })
 }
 
 /// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L1998-L2033>

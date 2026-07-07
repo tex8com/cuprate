@@ -616,6 +616,28 @@ define_request_and_response! {
 }
 
 define_request_and_response! {
+    rpc_access_info,
+    "cc73fe71162d564ffda8e549b79a350bca53c454" =>
+    core_rpc_server_commands_defs.h => 2525..=2559,
+    RpcAccessInfo,
+
+    Request {
+        client: String = default::<String>(), "default",
+    },
+
+    AccessResponseBase {
+        hashing_blob: String = default::<String>(), "default",
+        seed_height: u64 = default::<u64>(), "default",
+        seed_hash: String = default::<String>(), "default",
+        next_seed_hash: String = default::<String>(), "default",
+        cookie: u32 = default::<u32>(), "default",
+        diff: u64 = default::<u64>(), "default",
+        credits_per_hash_found: u64 = default::<u64>(), "default",
+        height: u64 = default::<u64>(), "default",
+    }
+}
+
+define_request_and_response! {
     get_miner_data,
     "cc73fe71162d564ffda8e549b79a350bca53c454" =>
     core_rpc_server_commands_defs.h => 996..=1044,
@@ -768,6 +790,7 @@ pub enum JsonRpcRequest {
     #[cfg_attr(feature = "serde", serde(rename = "get_txpool_backlog"))]
     GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest),
     GetOutputDistribution(GetOutputDistributionRequest),
+    RpcAccessInfo(RpcAccessInfoRequest),
     GetMinerData(GetMinerDataRequest),
     PruneBlockchain(PruneBlockchainRequest),
     CalcPow(CalcPowRequest),
@@ -795,6 +818,7 @@ impl RpcCallValue for JsonRpcRequest {
             Self::GetFeeEstimate(x) => x.is_restricted(),
             Self::GetTransactionPoolBacklog(x) => x.is_restricted(),
             Self::GetOutputDistribution(x) => x.is_restricted(),
+            Self::RpcAccessInfo(x) => x.is_restricted(),
             Self::GetMinerData(x) => x.is_restricted(),
             Self::AddAuxPow(x) => x.is_restricted(),
             Self::GetTxIdsLoose(x) => x.is_restricted(),
@@ -832,6 +856,7 @@ impl RpcCallValue for JsonRpcRequest {
             Self::GetFeeEstimate(x) => x.is_empty(),
             Self::GetTransactionPoolBacklog(x) => x.is_empty(),
             Self::GetOutputDistribution(x) => x.is_empty(),
+            Self::RpcAccessInfo(x) => x.is_empty(),
             Self::GetMinerData(x) => x.is_empty(),
             Self::AddAuxPow(x) => x.is_empty(),
             Self::GetTxIdsLoose(x) => x.is_empty(),
@@ -906,6 +931,7 @@ pub enum JsonRpcResponse {
     SyncInfo(SyncInfoResponse),
     GetTransactionPoolBacklog(GetTransactionPoolBacklogResponse),
     GetOutputDistribution(GetOutputDistributionResponse),
+    RpcAccessInfo(RpcAccessInfoResponse),
     GetMinerData(GetMinerDataResponse),
     PruneBlockchain(PruneBlockchainResponse),
     CalcPow(CalcPowResponse),
@@ -1865,6 +1891,24 @@ mod test {
         assert_eq!(
             request,
             JsonRpcRequest::GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest {})
+        );
+    }
+
+    #[test]
+    fn rpc_access_info_json_rpc_request() {
+        let request = from_value::<JsonRpcRequest>(json!({
+            "method": "rpc_access_info",
+            "params": {
+                "client": ""
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            JsonRpcRequest::RpcAccessInfo(RpcAccessInfoRequest {
+                client: String::new()
+            })
         );
     }
 
