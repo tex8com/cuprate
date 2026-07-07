@@ -32,7 +32,7 @@ use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
     output_cache::OutputCache,
     rpc::{OutputDistributionData, OutputHistogramInput},
-    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, TxsInBlock,
+    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, OutputOnChain, TxsInBlock,
 };
 
 use crate::{
@@ -588,7 +588,42 @@ fn outputs_vec(
     outputs: Vec<(Amount, AmountIndex)>,
     get_txid: bool,
 ) -> ResponseResult {
-    Ok(BlockchainResponse::OutputsVec(todo!()))
+    // Prepare tx/tables in `ThreadLocal`.
+    let env_inner = env.env_inner();
+    let tx_ro = thread_local(env);
+    let tables = thread_local(env);
+
+    let mut outputs = outputs
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, (amount, amount_index))| {
+            let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
+            let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
+
+            let id = PreRctOutputId {
+                amount,
+                amount_index,
+            };
+
+            let output_on_chain = id_to_output_on_chain(&id, get_txid, tables)?;
+
+            Ok((index, amount, amount_index, output_on_chain))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+
+    outputs.sort_by_key(|(index, _, _, _)| *index);
+
+    let mut grouped = Vec::<(Amount, Vec<(AmountIndex, OutputOnChain)>)>::new();
+    for (_, amount, amount_index, output_on_chain) in outputs {
+        match grouped.last_mut() {
+            Some((last_amount, amount_outputs)) if *last_amount == amount => {
+                amount_outputs.push((amount_index, output_on_chain));
+            }
+            _ => grouped.push((amount, vec![(amount_index, output_on_chain)])),
+        }
+    }
+
+    Ok(BlockchainResponse::OutputsVec(grouped))
 }
 
 /// [`BlockchainReadRequest::NumberOutputsWithAmount`].

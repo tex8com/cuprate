@@ -319,6 +319,52 @@ async fn test_template(
         }
     }
 
+    let outputs_vec_request = map
+        .iter()
+        .flat_map(|(amount, amount_index_set)| {
+            amount_index_set
+                .iter()
+                .map(|amount_index| (*amount, *amount_index))
+        })
+        .collect::<Vec<_>>();
+
+    let expected_outputs_vec = outputs_vec_request
+        .iter()
+        .map(|(amount, amount_index)| {
+            let id = PreRctOutputId {
+                amount: *amount,
+                amount_index: *amount_index,
+            };
+
+            (
+                *amount,
+                *amount_index,
+                id_to_output_on_chain(&id, false, &tables).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let request = BlockchainReadRequest::OutputsVec {
+        outputs: outputs_vec_request,
+        get_txid: false,
+    };
+    let response = reader.clone().oneshot(request).await;
+    println!("Response::OutputsVec response: {response:#?}");
+    let Ok(BlockchainResponse::OutputsVec(response)) = response else {
+        panic!("{response:#?}")
+    };
+
+    let response_outputs_vec = response
+        .into_iter()
+        .flat_map(|(amount, amount_index_vec)| {
+            amount_index_vec
+                .into_iter()
+                .map(move |(amount_index, output)| (amount, amount_index, output))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(expected_outputs_vec, response_outputs_vec);
+
     // Assert the amount of `Output`'s returned is as expected.
     let table_output_len = tables.outputs().len().unwrap() + tables.rct_outputs().len().unwrap();
     assert_eq!(output_count as u64, table_output_len);
