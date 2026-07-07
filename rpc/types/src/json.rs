@@ -771,6 +771,7 @@ pub enum JsonRpcRequest {
     GetLastBlockHeader(GetLastBlockHeaderRequest),
     GetBlockHeaderByHash(GetBlockHeaderByHashRequest),
     GetBlockHeaderByHeight(GetBlockHeaderByHeightRequest),
+    #[cfg_attr(feature = "serde", serde(alias = "getblockheadersrange"))]
     GetBlockHeadersRange(GetBlockHeadersRangeRequest),
     GetBlock(GetBlockRequest),
     GetConnections(GetConnectionsRequest),
@@ -1891,6 +1892,27 @@ mod test {
         assert_eq!(
             request,
             JsonRpcRequest::GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest {})
+        );
+    }
+
+    #[test]
+    fn get_block_headers_range_monero_alias_json_rpc_request() {
+        let request = from_value::<JsonRpcRequest>(json!({
+            "method": "getblockheadersrange",
+            "params": {
+                "start_height": 1,
+                "end_height": 2
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            JsonRpcRequest::GetBlockHeadersRange(GetBlockHeadersRangeRequest {
+                start_height: 1,
+                end_height: 2,
+                fill_pow_hash: false,
+            })
         );
     }
 
