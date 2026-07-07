@@ -1,12 +1,18 @@
 //! JSON-RPC 2.0 endpoint route functions.
 
 //---------------------------------------------------------------------------------------------------- Import
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use tower::ServiceExt;
 
 use cuprate_json_rpc::{Id, Response};
 use cuprate_rpc_types::{
-    json::{JsonRpcRequest, JsonRpcResponse},
+    json::{GetTransactionPoolBacklogResponse, JsonRpcRequest, JsonRpcResponse},
     RpcCallValue,
 };
 
@@ -17,7 +23,10 @@ use crate::rpc_handler::RpcHandler;
 pub(crate) async fn json_rpc<H: RpcHandler>(
     State(handler): State<H>,
     Json(mut request): Json<serde_json::Value>,
-) -> Result<Json<Response<JsonRpcResponse>>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
+    let is_txpool_backlog =
+        request.get("method").and_then(|v| v.as_str()) == Some("get_txpool_backlog");
+
     if let Some(object) = request.as_object_mut() {
         if object.contains_key("method") && !object.contains_key("params") {
             object.insert(
@@ -58,7 +67,7 @@ pub(crate) async fn json_rpc<H: RpcHandler>(
         //
         // - <https://github.com/monero-project/monero/blob/893916ad091a92e765ce3241b94e706ad012b62a/contrib/epee/include/net/http_server_handlers_map2.h#L244-L252>
         // - <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.h#L188>
-        return Ok(Json(Response::method_not_found(id)));
+        return Ok(Json(Response::<JsonRpcResponse>::method_not_found(id)).into_response());
     }
 
     // Send request.
@@ -66,7 +75,77 @@ pub(crate) async fn json_rpc<H: RpcHandler>(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    Ok(Json(Response::ok(id, response)))
+    if is_txpool_backlog {
+        let JsonRpcResponse::GetTransactionPoolBacklog(response) = response else {
+            panic!("RPC handler returned incorrect response");
+        };
+
+        return json_rpc_txpool_backlog_response(id, response);
+    }
+
+    Ok(Json(Response::ok(id, response)).into_response())
+}
+
+fn json_rpc_txpool_backlog_response(
+    id: Id,
+    response: GetTransactionPoolBacklogResponse,
+) -> Result<axum::response::Response, StatusCode> {
+    let mut body = Vec::new();
+    body.extend_from_slice(br#"{"jsonrpc":"2.0","id":"#);
+    serde_json::to_writer(&mut body, &id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    body.extend_from_slice(br#","result":{"status":"#);
+    serde_json::to_writer(&mut body, &response.base.status)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    body.extend_from_slice(br#","untrusted":"#);
+    body.extend_from_slice(if response.base.untrusted {
+        b"true"
+    } else {
+        b"false"
+    });
+    body.extend_from_slice(br#","credits":0,"top_hash":"","backlog":"#);
+
+    let backlog = txpool_backlog_as_pod_blob(&response.backlog);
+    push_epee_json_string(&mut body, &backlog);
+    body.extend_from_slice(b"}}");
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        Bytes::from(body),
+    )
+        .into_response())
+}
+
+fn txpool_backlog_as_pod_blob(backlog: &[cuprate_types::rpc::TxBacklogEntry]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(backlog.len() * 24);
+
+    for entry in backlog {
+        bytes.extend_from_slice(&entry.weight.to_le_bytes());
+        bytes.extend_from_slice(&entry.fee.to_le_bytes());
+        bytes.extend_from_slice(&entry.time_in_pool.to_le_bytes());
+    }
+
+    bytes
+}
+
+fn push_epee_json_string(json: &mut Vec<u8>, bytes: &[u8]) {
+    json.push(b'"');
+
+    for byte in bytes {
+        match *byte {
+            b'\x08' => json.extend_from_slice(br"\b"),
+            b'\x0c' => json.extend_from_slice(br"\f"),
+            b'\n' => json.extend_from_slice(br"\n"),
+            b'\r' => json.extend_from_slice(br"\r"),
+            b'\t' => json.extend_from_slice(br"\t"),
+            b'\x0b' => json.extend_from_slice(br"\v"),
+            b'"' => json.extend_from_slice(br#"\""#),
+            b'\\' => json.extend_from_slice(br"\\"),
+            b'/' => json.extend_from_slice(br"\/"),
+            byte => json.push(byte),
+        }
+    }
+
+    json.push(b'"');
 }
 
 //---------------------------------------------------------------------------------------------------- Tests

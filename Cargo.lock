@@ -1516,6 +1516,7 @@ dependencies = [
  "cuprate-json-rpc",
  "cuprate-rpc-types",
  "cuprate-test-utils",
+ "cuprate-types",
  "flate2",
  "futures",
  "paste",
