@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "epee")]
 use cuprate_epee_encoding::{
+    container_as_blob::ContainerAsBlob,
     epee_object, error,
     macros::bytes::{Buf, BufMut},
     read_epee_value, write_field, EpeeObject, EpeeObjectBuilder,
@@ -295,9 +296,23 @@ impl EpeeObject for Distribution {
 
     fn write_fields<B: BufMut>(self, w: &mut B) -> error::Result<()> {
         match self {
-            Self::Uncompressed(s) => {
-                s.write_fields(w)?;
+            Self::Uncompressed(DistributionUncompressed {
+                start_height,
+                base,
+                distribution,
+                amount,
+                binary,
+            }) => {
+                write_field(amount, "amount", w)?;
+                write_field(start_height, "start_height", w)?;
+                write_field(binary, "binary", w)?;
                 write_field(false, "compress", w)?;
+                if binary {
+                    write_field(ContainerAsBlob::from(distribution), "distribution", w)?;
+                } else {
+                    write_field(distribution, "distribution", w)?;
+                }
+                write_field(base, "base", w)?;
             }
 
             Self::CompressedBinary(DistributionCompressedBinary {
@@ -308,12 +323,12 @@ impl EpeeObject for Distribution {
             }) => {
                 let compressed_data = compress_integer_array(&distribution);
 
-                write_field(start_height, "start_height", w)?;
-                write_field(base, "base", w)?;
-                write_field(compressed_data, "compressed_data", w)?;
                 write_field(amount, "amount", w)?;
+                write_field(start_height, "start_height", w)?;
                 write_field(true, "binary", w)?;
                 write_field(true, "compress", w)?;
+                write_field(compressed_data, "compressed_data", w)?;
+                write_field(base, "base", w)?;
             }
         }
 
@@ -370,6 +385,22 @@ mod tests {
             .as_ref()
             .windows("compressed_data".len())
             .any(|window| window == b"compressed_data"));
+
+        let field_position = |field: &[u8]| {
+            bytes
+                .as_ref()
+                .windows(field.len())
+                .position(|window| window == field)
+                .unwrap()
+        };
+
+        assert!(
+            field_position(b"amount") < field_position(b"start_height")
+                && field_position(b"start_height") < field_position(b"binary")
+                && field_position(b"binary") < field_position(b"compress")
+                && field_position(b"compress") < field_position(b"compressed_data")
+                && field_position(b"compressed_data") < field_position(b"base")
+        );
 
         let mut bytes = bytes.freeze();
         let decoded = cuprate_epee_encoding::from_bytes(&mut bytes).unwrap();
