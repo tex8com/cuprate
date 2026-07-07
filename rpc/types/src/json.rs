@@ -765,6 +765,7 @@ pub enum JsonRpcRequest {
     GetAlternateChains(GetAlternateChainsRequest),
     RelayTx(RelayTxRequest),
     SyncInfo(SyncInfoRequest),
+    #[cfg_attr(feature = "serde", serde(rename = "get_txpool_backlog"))]
     GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest),
     GetOutputDistribution(GetOutputDistributionRequest),
     GetMinerData(GetMinerDataRequest),
@@ -921,7 +922,7 @@ mod test {
     use hex_literal::hex;
     use pretty_assertions::assert_eq;
     use serde::de::DeserializeOwned;
-    use serde_json::{from_str, from_value, Value};
+    use serde_json::{from_str, from_value, json, Value};
 
     use cuprate_test_utils::rpc::data::json;
     use cuprate_types::HardFork;
@@ -1850,6 +1851,20 @@ mod test {
                 cumulative: false,
                 to_height: 0,
             }
+        );
+    }
+
+    #[test]
+    fn get_txpool_backlog_json_rpc_request() {
+        let request = from_value::<JsonRpcRequest>(json!({
+            "method": "get_txpool_backlog",
+            "params": {}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            JsonRpcRequest::GetTransactionPoolBacklog(GetTransactionPoolBacklogRequest {})
         );
     }
 
