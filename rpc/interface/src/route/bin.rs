@@ -1,9 +1,14 @@
 //! Binary route functions.
 
 //---------------------------------------------------------------------------------------------------- Import
-use axum::{body::Bytes, extract::State, http::{StatusCode, HeaderMap, header}};
-use tower::ServiceExt;
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tower::ServiceExt;
 
 static ACTIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -32,7 +37,8 @@ fn maybe_gzip(data: Bytes, accept_encoding: Option<&str>) -> (Bytes, bool, u128)
             use flate2::Compression;
             use std::io::Write;
 
-            let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 3), Compression::fast());
+            let mut encoder =
+                GzEncoder::new(Vec::with_capacity(data.len() / 3), Compression::fast());
             if encoder.write_all(&data).is_ok() {
                 if let Ok(compressed) = encoder.finish() {
                     if compressed.len() < data.len() {
@@ -95,23 +101,6 @@ macro_rules! generate_endpoints_with_input {
     }};
 }
 
-/// This macro generates route functions that expect _no_ input.
-macro_rules! generate_endpoints_with_no_input {
-    ($(
-        $endpoint:ident => $variant:ident
-    ),*) => { paste::paste! {
-        $(
-            pub(crate) async fn $endpoint<H: RpcHandler>(
-                State(handler): State<H>,
-                headers: HeaderMap,
-            ) -> Result<axum::response::Response, StatusCode> {
-                const REQUEST: BinRequest = BinRequest::$variant([<$variant Request>] {});
-                generate_endpoints_inner!($variant, handler, headers, REQUEST)
-            }
-        )*
-    }};
-}
-
 /// De-duplicated inner function body.
 macro_rules! generate_endpoints_inner {
     ($variant:ident, $handler:ident, $headers:ident, $request:expr_2021) => {
@@ -157,8 +146,52 @@ generate_endpoints_with_input! {
     get_output_distribution => GetOutputDistribution
 }
 
-generate_endpoints_with_no_input! {
-    get_transaction_pool_hashes => GetTransactionPoolHashes
+pub(crate) async fn get_transaction_pool_hashes<H: RpcHandler>(
+    State(handler): State<H>,
+) -> Result<axum::response::Response, StatusCode> {
+    let request = BinRequest::GetTransactionPoolHashes(GetTransactionPoolHashesRequest {});
+    let response = handler.oneshot(request).await.map_err(|e| {
+        eprintln!("BIN RPC handler error: {e:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let BinResponse::GetTransactionPoolHashes(response) = response else {
+        panic!("RPC handler returned incorrect response");
+    };
+
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        br#"{"credits":0,"top_hash":"","status":"OK","untrusted":false,"tx_hashes":"#,
+    );
+    push_epee_json_string(&mut body, response.tx_hashes.take_bytes().as_ref());
+    body.push(b'}');
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        Bytes::from(body),
+    )
+        .into_response())
+}
+
+fn push_epee_json_string(json: &mut Vec<u8>, bytes: &[u8]) {
+    json.push(b'"');
+
+    for byte in bytes {
+        match *byte {
+            b'\x08' => json.extend_from_slice(br"\b"),
+            b'\x0c' => json.extend_from_slice(br"\f"),
+            b'\n' => json.extend_from_slice(br"\n"),
+            b'\r' => json.extend_from_slice(br"\r"),
+            b'\t' => json.extend_from_slice(br"\t"),
+            b'\x0b' => json.extend_from_slice(br"\v"),
+            b'"' => json.extend_from_slice(br#"\""#),
+            b'\\' => json.extend_from_slice(br"\\"),
+            b'/' => json.extend_from_slice(br"\/"),
+            byte => json.push(byte),
+        }
+    }
+
+    json.push(b'"');
 }
 
 //---------------------------------------------------------------------------------------------------- Tests

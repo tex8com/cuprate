@@ -16,8 +16,23 @@ use crate::rpc_handler::RpcHandler;
 /// The `/json_rpc` route function used in [`crate::RouterBuilder`].
 pub(crate) async fn json_rpc<H: RpcHandler>(
     State(handler): State<H>,
-    Json(request): Json<cuprate_json_rpc::Request<JsonRpcRequest>>,
+    Json(mut request): Json<serde_json::Value>,
 ) -> Result<Json<Response<JsonRpcResponse>>, StatusCode> {
+    if let Some(object) = request.as_object_mut() {
+        if object.contains_key("method") && !object.contains_key("params") {
+            object.insert(
+                "params".to_string(),
+                serde_json::Value::Object(Default::default()),
+            );
+        }
+    }
+
+    let request: cuprate_json_rpc::Request<JsonRpcRequest> = serde_json::from_value(request)
+        .map_err(|e| {
+            eprintln!("JSON-RPC deserialization error: {e:?}");
+            StatusCode::UNPROCESSABLE_ENTITY
+        })?;
+
     // TODO: <https://www.jsonrpc.org/specification#notification>
     //
     // JSON-RPC notifications (requests without `id`)
