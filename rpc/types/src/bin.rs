@@ -93,7 +93,7 @@ define_request_and_response! {
     GetOuts,
     Request {
         outputs: Vec<GetOutputsOut> = default::<Vec<GetOutputsOut>>(), "default",
-        get_txid: bool,
+        get_txid: bool = default::<bool>(), "default",
     },
     AccessResponseBase {
         outs: Vec<OutKeyBin> = default::<Vec<OutKeyBin>>(), "default",

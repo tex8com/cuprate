@@ -391,8 +391,8 @@ define_request_and_response! {
     GetOuts,
 
     Request {
-        outputs: Vec<GetOutputsOut>,
-        get_txid: bool,
+        outputs: Vec<GetOutputsOut> = default::<Vec<GetOutputsOut>>(), "default",
+        get_txid: bool = default::<bool>(), "default",
     },
 
     ResponseBase {
