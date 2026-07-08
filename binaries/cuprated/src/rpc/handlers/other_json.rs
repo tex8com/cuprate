@@ -169,18 +169,17 @@ async fn get_transactions(
                 (HexVec(tx.pruned_blob), HexVec(tx.prunable_blob))
             };
 
-            let as_hex = if pruned_as_hex.is_empty() {
-                // `monerod` will insert a `""` into the `txs_as_hex` array for pruned transactions.
-                // curl http://127.0.0.1:18081/get_transactions -d '{"txs_hashes":["4c8b98753d1577d225a497a50f453827cff3aa023a4add60ec4ce4f923f75de8"]}' -H 'Content-Type: application/json'
+            // `monerod` inserts `""` into `txs_as_hex` only when returning pruned transactions.
+            let as_hex = if request.prune && !pruned_as_hex.is_empty() {
                 HexVec::new()
             } else {
-                HexVec(tx.tx_blob)
+                HexVec(tx.tx_blob.clone())
             };
 
             txs_as_hex.push(as_hex.clone());
 
             let as_json = if request.decode_as_json {
-                let tx = Transaction::read(&mut as_hex.as_slice())?;
+                let tx = Transaction::read(&mut tx.tx_blob.as_slice())?;
                 let json_type = cuprate_types::json::tx::Transaction::from(tx);
                 let json = serde_json::to_string(&json_type).unwrap();
                 txs_as_json.push(json.clone());

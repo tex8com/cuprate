@@ -27,12 +27,13 @@ use thread_local::ThreadLocal;
 
 use cuprate_database::{ConcreteEnv, DatabaseRo, DbResult, Env, EnvInner, RuntimeError};
 use cuprate_database_service::{init_thread_pool, DatabaseReadService, ReaderThreads};
-use cuprate_helper::map::combine_low_high_bits_to_u128;
+use cuprate_helper::{cast::usize_to_u64, map::combine_low_high_bits_to_u128};
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
     output_cache::OutputCache,
     rpc::{OutputDistributionData, OutputHistogramInput},
-    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, OutputOnChain, TxsInBlock,
+    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, OutputOnChain, TxInBlockchain,
+    TxsInBlock,
 };
 
 use crate::{
@@ -57,7 +58,7 @@ use crate::{
     },
     tables::{
         AltBlockHeights, BlockHeights, BlockInfos, OpenTables, RctOutputs, Tables, TablesIter,
-        TxIds, TxOutputs,
+        TxBlobs, TxHeights, TxIds, TxOutputs,
     },
     types::{
         AltBlockHeight, Amount, AmountIndex, BlockHash, BlockHeight, KeyImage, PreRctOutputId,
@@ -1011,10 +1012,58 @@ fn alt_chain_count(env: &ConcreteEnv) -> ResponseResult {
 
 /// [`BlockchainReadRequest::Transactions`]
 fn transactions(env: &ConcreteEnv, tx_hashes: HashSet<[u8; 32]>) -> ResponseResult {
-    Ok(BlockchainResponse::Transactions {
-        txs: todo!(),
-        missed_txs: todo!(),
-    })
+    let env_inner = env.env_inner();
+    let tx_ro = env_inner.tx_ro()?;
+
+    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
+    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+    let table_tx_ids = env_inner.open_db_ro::<TxIds>(&tx_ro)?;
+    let table_tx_blobs = env_inner.open_db_ro::<TxBlobs>(&tx_ro)?;
+    let table_tx_heights = env_inner.open_db_ro::<TxHeights>(&tx_ro)?;
+    let table_tx_outputs = env_inner.open_db_ro::<TxOutputs>(&tx_ro)?;
+
+    let mut top_height = None;
+    let mut txs = Vec::with_capacity(tx_hashes.len());
+    let mut missed_txs = Vec::new();
+
+    for tx_hash in tx_hashes {
+        let tx_id = match table_tx_ids.get(&tx_hash) {
+            Ok(tx_id) => tx_id,
+            Err(RuntimeError::KeyNotFound) => {
+                missed_txs.push(tx_hash);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let block_height = table_tx_heights.get(&tx_id)?;
+        let block_info = table_block_infos.get(&block_height)?;
+        let tx_blob = table_tx_blobs.get(&tx_id)?.0;
+        let output_indices = table_tx_outputs.get(&tx_id)?.0;
+        let top_height = match top_height {
+            Some(top_height) => top_height,
+            None => {
+                let height = top_block_height(&table_block_heights)?;
+                top_height = Some(height);
+                height
+            }
+        };
+        let confirmations = top_height.saturating_sub(block_height).saturating_add(1);
+
+        txs.push(TxInBlockchain {
+            block_height: usize_to_u64(block_height),
+            block_timestamp: block_info.timestamp,
+            confirmations: usize_to_u64(confirmations),
+            output_indices,
+            tx_hash,
+            tx_blob,
+            pruned_blob: Vec::new(),
+            prunable_blob: Vec::new(),
+            prunable_hash: [0; 32],
+        });
+    }
+
+    Ok(BlockchainResponse::Transactions { txs, missed_txs })
 }
 
 /// [`BlockchainReadRequest::TotalRctOutputs`]

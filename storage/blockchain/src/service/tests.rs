@@ -6,7 +6,10 @@
 #![allow(clippy::await_holding_lock, clippy::too_many_lines)]
 
 //---------------------------------------------------------------------------------------------------- Use
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use indexmap::{IndexMap, IndexSet};
 use pretty_assertions::assert_eq;
@@ -378,6 +381,60 @@ async fn test_template(
 #[test]
 fn init_drop() {
     let (_reader, _writer, _env, _tempdir) = init_service();
+}
+
+#[tokio::test]
+async fn transactions_reports_unknown_hashes_without_crashing() {
+    let (reader, _writer, _env, _tempdir) = init_service();
+    let missing_hash = [0x42; 32];
+
+    let response = reader
+        .oneshot(BlockchainReadRequest::Transactions {
+            tx_hashes: HashSet::from([missing_hash]),
+        })
+        .await
+        .unwrap();
+
+    let BlockchainResponse::Transactions { txs, missed_txs } = response else {
+        panic!("{response:#?}");
+    };
+
+    assert!(txs.is_empty());
+    assert_eq!(missed_txs, vec![missing_hash]);
+}
+
+#[tokio::test]
+async fn transactions_returns_confirmed_tx_and_misses() {
+    let (reader, mut writer, _env, _tempdir) = init_service();
+    let mut block = BLOCK_V1_TX2.clone();
+    block.height = 0;
+    let expected_tx = block.txs[0].clone();
+    let missing_hash = [0x24; 32];
+
+    let response = writer
+        .call(BlockchainWriteRequest::WriteBlock(block))
+        .await
+        .unwrap();
+    assert_eq!(response, BlockchainResponse::Ok);
+
+    let response = reader
+        .oneshot(BlockchainReadRequest::Transactions {
+            tx_hashes: HashSet::from([expected_tx.tx_hash, missing_hash]),
+        })
+        .await
+        .unwrap();
+
+    let BlockchainResponse::Transactions { txs, missed_txs } = response else {
+        panic!("{response:#?}");
+    };
+
+    assert_eq!(missed_txs, vec![missing_hash]);
+    assert_eq!(txs.len(), 1);
+    assert_eq!(txs[0].block_height, 0);
+    assert_eq!(txs[0].confirmations, 1);
+    assert_eq!(txs[0].tx_hash, expected_tx.tx_hash);
+    assert_eq!(txs[0].tx_blob, expected_tx.tx_blob);
+    assert!(!txs[0].output_indices.is_empty());
 }
 
 #[tokio::test]
