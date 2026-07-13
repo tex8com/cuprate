@@ -576,7 +576,6 @@ pub async fn tx_output_indexes(
     Ok(o_indexes)
 }
 
-
 pub async fn tx_output_indexes_batch(
     blockchain_read: &mut BlockchainReadHandle,
     tx_hashes: Vec<[u8; 32]>,

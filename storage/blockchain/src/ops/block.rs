@@ -9,10 +9,10 @@ use monero_oxide::{
     transaction::Transaction,
 };
 
-use cuprate_fixed_bytes::ByteArray;
 use cuprate_database::{
     DbResult, RuntimeError, StorableVec, {DatabaseRo, DatabaseRw},
 };
+use cuprate_fixed_bytes::ByteArray;
 use cuprate_helper::cast::usize_to_u64;
 use cuprate_helper::{
     map::{combine_low_high_bits_to_u128, split_u128_into_low_high_bits},
@@ -468,8 +468,8 @@ pub fn block_exists(
 mod test {
     use pretty_assertions::assert_eq;
 
+    use cuprate_database::{Env, EnvInner, TxRw};
     use cuprate_fixed_bytes::ByteArray;
-use cuprate_database::{Env, EnvInner, TxRw};
     use cuprate_test_utils::data::{BLOCK_V16_TX0, BLOCK_V1_TX2, BLOCK_V9_TX3};
 
     use crate::{

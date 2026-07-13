@@ -325,14 +325,13 @@ impl<D: Database + Clone + Send + 'static> ContextTask<D> {
                 BlockChainContextResponse::HardForkInfo(info)
             }
             BlockChainContextRequest::FeeEstimate { .. } => {
-                BlockChainContextResponse::FeeEstimate(crate::FeeEstimate { fees: vec![20000],
+                BlockChainContextResponse::FeeEstimate(crate::FeeEstimate {
+                    fees: vec![20000],
                     fee: 20000,
                     quantization_mask: 10000,
                 })
             }
-            BlockChainContextRequest::AltChains => {
-                BlockChainContextResponse::AltChains(vec![])
-            }
+            BlockChainContextRequest::AltChains => BlockChainContextResponse::AltChains(vec![]),
             BlockChainContextRequest::CalculatePow { .. } => {
                 todo!("CalculatePow not yet implemented")
             }
