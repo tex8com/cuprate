@@ -19,9 +19,9 @@ use cuprate_helper::{
     tx::tx_fee,
 };
 use cuprate_types::{
-    AltBlockInformation, BlockCompleteEntry, ChainId, ExtendedBlockHeader, HardFork,
-    PrunedTxBlobEntry, TransactionBlobs, VerifiedBlockInformation, VerifiedTransactionInformation,
-    blockchain::WalletScanRange,
+    blockchain::WalletScanRange, AltBlockInformation, BlockCompleteEntry, ChainId,
+    ExtendedBlockHeader, HardFork, PrunedTxBlobEntry, TransactionBlobs, VerifiedBlockInformation,
+    VerifiedTransactionInformation,
 };
 
 use crate::{
@@ -309,6 +309,7 @@ pub fn get_block_complete_entry_from_height(
 pub fn get_wallet_scan_range(
     start_height: BlockHeight,
     end_height: BlockHeight,
+    prune: bool,
     tables: &impl TablesIter,
 ) -> Result<WalletScanRange, RuntimeError> {
     if start_height >= end_height {
@@ -400,23 +401,52 @@ pub fn get_wallet_scan_range(
             .expect("The number of txs per block will not exceed u64::MAX");
         block.extend_from_slice(bytemuck::must_cast_slice(&tx_hashes.0));
 
-        let normal_txs = tx_blobs
+        let ordinary_tx_blobs = tx_blobs
             .get(tx_offset.saturating_add(1)..tx_end)
             .ok_or(RuntimeError::KeyNotFound)?
-            .iter()
-            .cloned()
-            .map(Bytes::from)
-            .collect();
+            .iter();
+        let txs = if prune {
+            let pruned_entries = ordinary_tx_blobs
+                .map(|tx_blob| {
+                    let tx = Transaction::read(&mut tx_blob.as_slice()).map_err(|_| {
+                        RuntimeError::Io(std::io::Error::other("failed to parse tx"))
+                    })?;
+
+                    if tx.version() == 1 {
+                        Ok(PrunedTxBlobEntry {
+                            blob: Bytes::from(tx_blob.clone()),
+                            prunable_hash: ByteArray::from([0u8; 32]),
+                        })
+                    } else {
+                        let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
+                        if prunable_bytes.is_empty() {
+                            Ok(PrunedTxBlobEntry {
+                                blob: Bytes::from(tx_blob.clone()),
+                                prunable_hash: ByteArray::from([0u8; 32]),
+                            })
+                        } else {
+                            Ok(PrunedTxBlobEntry {
+                                blob: Bytes::from(pruned_tx.serialize()),
+                                prunable_hash: ByteArray::from(keccak256(&prunable_bytes)),
+                            })
+                        }
+                    }
+                })
+                .collect::<Result<_, RuntimeError>>()?;
+            TransactionBlobs::Pruned(pruned_entries)
+        } else {
+            TransactionBlobs::Normal(ordinary_tx_blobs.cloned().map(Bytes::from).collect())
+        };
         let block_outputs = tx_outputs
             .get(tx_offset..tx_end)
             .ok_or(RuntimeError::KeyNotFound)?
             .to_vec();
 
         blocks.push(BlockCompleteEntry {
-            pruned: false,
+            pruned: prune,
             block: Bytes::from(block),
             block_weight: 0,
-            txs: TransactionBlobs::Normal(normal_txs),
+            txs,
         });
         output_indices.push(block_outputs);
         tx_offset = tx_end;
@@ -688,22 +718,26 @@ mod test {
 
             // The 1B range reader must return byte-identical block entries
             // and the same per-transaction output indices as the legacy
-            // independent lookup path.
-            let wallet_scan = get_wallet_scan_range(0, blocks.len(), &tables).unwrap();
-            assert_eq!(wallet_scan.blocks.len(), blocks.len());
-            assert_eq!(wallet_scan.output_indices.len(), blocks.len());
-            for height in 0..blocks.len() {
-                assert_eq!(
-                    wallet_scan.blocks[height],
-                    get_block_complete_entry_from_height(&height, &tables).unwrap()
-                );
-                let info = get_block_info(&height, tables.block_infos()).unwrap();
-                let tx_count = tables.block_txs_hashes().get(&height).unwrap().0.len() + 1;
-                let expected_indices = (info.mining_tx_index
-                    ..info.mining_tx_index + usize_to_u64(tx_count))
-                    .map(|tx_id| tables.tx_outputs().get(&tx_id).unwrap().0)
-                    .collect::<Vec<_>>();
-                assert_eq!(wallet_scan.output_indices[height], expected_indices);
+            // independent lookup path, for both normal and pruned responses.
+            for prune in [false, true] {
+                let wallet_scan = get_wallet_scan_range(0, blocks.len(), prune, &tables).unwrap();
+                assert_eq!(wallet_scan.blocks.len(), blocks.len());
+                assert_eq!(wallet_scan.output_indices.len(), blocks.len());
+                for height in 0..blocks.len() {
+                    let legacy = if prune {
+                        get_block_complete_entry_from_height_pruned(&height, &tables).unwrap()
+                    } else {
+                        get_block_complete_entry_from_height(&height, &tables).unwrap()
+                    };
+                    assert_eq!(wallet_scan.blocks[height], legacy);
+                    let info = get_block_info(&height, tables.block_infos()).unwrap();
+                    let tx_count = tables.block_txs_hashes().get(&height).unwrap().0.len() + 1;
+                    let expected_indices = (info.mining_tx_index
+                        ..info.mining_tx_index + usize_to_u64(tx_count))
+                        .map(|tx_id| tables.tx_outputs().get(&tx_id).unwrap().0)
+                        .collect::<Vec<_>>();
+                    assert_eq!(wallet_scan.output_indices[height], expected_indices);
+                }
             }
 
             // Both height and hash should result in getting the same data.

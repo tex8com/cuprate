@@ -448,6 +448,7 @@ pub(crate) async fn capped_wallet_scan_range_with_metrics(
     response_start_height: usize,
     chain_height: usize,
     block_count: usize,
+    prune: bool,
     no_miner_tx: bool,
     max_response_bytes: usize,
     max_tx_count: usize,
@@ -468,6 +469,7 @@ pub(crate) async fn capped_wallet_scan_range_with_metrics(
         &mut state.blockchain_read,
         response_start_height,
         end_height,
+        prune,
     )
     .await?;
     let database_ms = t_database.elapsed().as_secs_f64() * 1000.0;

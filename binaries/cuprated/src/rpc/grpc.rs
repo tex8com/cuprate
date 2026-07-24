@@ -242,7 +242,7 @@ async fn fetch_chunk(
 
     let want = chunk_blocks.min(target_end - start);
     let t_fetch = Instant::now();
-    let range_read = sync_range_reads_enabled() && !prune;
+    let range_read = sync_range_reads_enabled();
     let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics) = if range_read {
         let (blocks, output_indices, fetch_metrics, index_metrics) =
             bin_handlers::capped_wallet_scan_range_with_metrics(
@@ -250,6 +250,7 @@ async fn fetch_chunk(
                 start,
                 chain_height,
                 want,
+                prune,
                 no_miner_tx,
                 MAX_GRPC_CHUNK_RESPONSE_BYTES,
                 MAX_GRPC_CHUNK_TX_COUNT,

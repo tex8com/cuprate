@@ -57,7 +57,7 @@ pub enum BlockchainReadRequest {
     /// The input is the block heights.
     BlockCompleteEntriesByHeight(Vec<usize>),
 
-    /// Request a consecutive, unpruned wallet-scan range.
+    /// Request a consecutive wallet-scan range.
     ///
     /// The range is half-open (`start_height..end_height`). Implementations
     /// should use ordered table iteration rather than independent lookups.
@@ -66,6 +66,8 @@ pub enum BlockchainReadRequest {
         start_height: usize,
         /// End height, exclusive.
         end_height: usize,
+        /// Return ordinary transaction blobs in the standard pruned wire form.
+        prune: bool,
     },
 
     /// Same as above but returns pruned TX blobs.

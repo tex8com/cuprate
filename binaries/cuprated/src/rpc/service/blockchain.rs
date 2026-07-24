@@ -544,6 +544,7 @@ pub async fn wallet_scan_range(
     blockchain_read: &mut BlockchainReadHandle,
     start_height: usize,
     end_height: usize,
+    prune: bool,
 ) -> Result<WalletScanRange, Error> {
     let BlockchainResponse::WalletScanRange(range) = blockchain_read
         .ready()
@@ -551,6 +552,7 @@ pub async fn wallet_scan_range(
         .call(BlockchainReadRequest::WalletScanRange {
             start_height,
             end_height,
+            prune,
         })
         .await?
     else {

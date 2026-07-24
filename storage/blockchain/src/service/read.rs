@@ -118,7 +118,8 @@ fn map_request(
         R::WalletScanRange {
             start_height,
             end_height,
-        } => wallet_scan_range(env, start_height, end_height),
+            prune,
+        } => wallet_scan_range(env, start_height, end_height, prune),
         R::BlockCompleteEntriesByHeightPruned(heights) => {
             block_complete_entries_by_height_pruned(env, heights)
         }
@@ -298,6 +299,7 @@ fn wallet_scan_range(
     env: &ConcreteEnv,
     start_height: BlockHeight,
     end_height: BlockHeight,
+    prune: bool,
 ) -> ResponseResult {
     let env_inner = env.env_inner();
     let tx_ro = env_inner.tx_ro()?;
@@ -306,6 +308,7 @@ fn wallet_scan_range(
     Ok(BlockchainResponse::WalletScanRange(get_wallet_scan_range(
         start_height,
         end_height,
+        prune,
         &tables,
     )?))
 }
