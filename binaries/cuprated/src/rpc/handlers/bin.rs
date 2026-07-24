@@ -458,6 +458,7 @@ pub(crate) async fn capped_wallet_scan_range_with_metrics(
         Vec<BlockOutputIndices>,
         BlockFetchMetrics,
         OutputIndicesMetrics,
+        bool,
     ),
     Error,
 > {
@@ -472,6 +473,7 @@ pub(crate) async fn capped_wallet_scan_range_with_metrics(
         prune,
     )
     .await?;
+    let used_ordered_ranges = range.used_ordered_ranges;
     let database_ms = t_database.elapsed().as_secs_f64() * 1000.0;
 
     let mut fetch_metrics = BlockFetchMetrics {
@@ -528,7 +530,13 @@ pub(crate) async fn capped_wallet_scan_range_with_metrics(
     fetch_metrics.estimated_response_bytes = response_bytes;
     index_metrics.reconstruct_ms = fetch_metrics.cap_and_collect_ms;
 
-    Ok((blocks, output_indices, fetch_metrics, index_metrics))
+    Ok((
+        blocks,
+        output_indices,
+        fetch_metrics,
+        index_metrics,
+        used_ordered_ranges,
+    ))
 }
 
 fn block_response_bytes(block: &BlockCompleteEntry) -> usize {

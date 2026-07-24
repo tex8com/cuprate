@@ -94,11 +94,11 @@ impl<T: Table> DatabaseIter<T> for HeedTableRo<'_, T> {
     fn get_range<'a, Range>(
         &'a self,
         range: Range,
-    ) -> DbResult<impl Iterator<Item = DbResult<T::Value>> + 'a>
+    ) -> DbResult<impl Iterator<Item = DbResult<(T::Key, T::Value)>> + 'a>
     where
         Range: RangeBounds<T::Key> + 'a,
     {
-        Ok(self.db.range(self.tx_ro, &range)?.map(|res| Ok(res?.1)))
+        Ok(self.db.range(self.tx_ro, &range)?.map(|res| Ok(res?)))
     }
 
     #[inline]

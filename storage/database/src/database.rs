@@ -34,7 +34,7 @@ Each iteration of the iterator has the potential to error as well."
 /// - <https://github.com/Cuprate/cuprate/pull/102#discussion_r1548695610>
 /// - <https://github.com/Cuprate/cuprate/pull/104>
 pub trait DatabaseIter<T: Table> {
-    /// Get an [`Iterator`] of values corresponding to a range of keys.
+    /// Get an [`Iterator`] of key/value pairs corresponding to a range of keys.
     ///
     /// For example:
     /// ```rust,ignore
@@ -44,13 +44,13 @@ pub trait DatabaseIter<T: Table> {
     /// ```
     ///
     /// Although the returned iterator itself is tied to the lifetime
-    /// of `&'a self`, the returned values from the iterator are _owned_.
+    /// of `&'a self`, the returned keys and values from the iterator are owned.
     ///
     #[doc = doc_iter!()]
     fn get_range<'a, Range>(
         &'a self,
         range: Range,
-    ) -> DbResult<impl Iterator<Item = DbResult<T::Value>> + 'a>
+    ) -> DbResult<impl Iterator<Item = DbResult<(T::Key, T::Value)>> + 'a>
     where
         Range: RangeBounds<T::Key> + 'a;
 

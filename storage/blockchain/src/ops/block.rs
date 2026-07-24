@@ -310,41 +310,69 @@ pub fn get_wallet_scan_range(
     start_height: BlockHeight,
     end_height: BlockHeight,
     prune: bool,
-    tables: &impl TablesIter,
+    tables: &(impl Tables + TablesIter),
 ) -> Result<WalletScanRange, RuntimeError> {
     if start_height >= end_height {
         return Ok(WalletScanRange {
             blocks: vec![],
             output_indices: vec![],
+            used_ordered_ranges: true,
         });
     }
 
-    let block_infos = tables
+    let block_infos_range = tables
         .block_infos_iter()
         .get_range(start_height..end_height)?
         .collect::<DbResult<Vec<_>>>()?;
-    let block_headers = tables
+    let block_headers_range = tables
         .block_header_blobs_iter()
         .get_range(start_height..end_height)?
         .collect::<DbResult<Vec<_>>>()?;
-    let block_tx_hashes = tables
+    let block_tx_hashes_range = tables
         .block_txs_hashes_iter()
         .get_range(start_height..end_height)?
         .collect::<DbResult<Vec<_>>>()?;
 
-    if block_infos.len() != block_headers.len() || block_infos.len() != block_tx_hashes.len() {
-        return Err(RuntimeError::Io(std::io::Error::other(format!(
-            "wallet scan range metadata mismatch: start={start_height} end={end_height} infos={} headers={} tx_hash_lists={}",
-            block_infos.len(),
-            block_headers.len(),
-            block_tx_hashes.len(),
-        ))));
-    }
+    let expected_block_count = end_height - start_height;
+    let metadata_ranges_valid = block_infos_range.len() == expected_block_count
+        && block_headers_range.len() == expected_block_count
+        && block_tx_hashes_range.len() == expected_block_count
+        && block_infos_range
+            .iter()
+            .enumerate()
+            .all(|(offset, (key, _))| *key == start_height.saturating_add(offset))
+        && block_headers_range
+            .iter()
+            .enumerate()
+            .all(|(offset, (key, _))| *key == start_height.saturating_add(offset))
+        && block_tx_hashes_range
+            .iter()
+            .enumerate()
+            .all(|(offset, (key, _))| *key == start_height.saturating_add(offset));
+
+    let (block_infos, block_headers, block_tx_hashes) = if metadata_ranges_valid {
+        (
+            block_infos_range.into_iter().map(|(_, value)| value).collect(),
+            block_headers_range.into_iter().map(|(_, value)| value).collect(),
+            block_tx_hashes_range.into_iter().map(|(_, value)| value).collect(),
+        )
+    } else {
+        let mut infos = Vec::with_capacity(expected_block_count);
+        let mut headers = Vec::with_capacity(expected_block_count);
+        let mut hashes = Vec::with_capacity(expected_block_count);
+        for height in start_height..end_height {
+            infos.push(tables.block_infos().get(&height)?);
+            headers.push(tables.block_header_blobs().get(&height)?);
+            hashes.push(tables.block_txs_hashes().get(&height)?);
+        }
+        (infos, headers, hashes)
+    };
 
     let Some(first_info) = block_infos.first() else {
         return Ok(WalletScanRange {
             blocks: vec![],
             output_indices: vec![],
+            used_ordered_ranges: metadata_ranges_valid,
         });
     };
     let Some(last_info) = block_infos.last() else {
@@ -361,26 +389,47 @@ pub fn get_wallet_scan_range(
         .saturating_add(1)
         .saturating_add(usize_to_u64(last_non_miner_txs));
 
-    let tx_blobs = tables
+    let tx_blobs_range = tables
         .tx_blobs_iter()
         .get_range(first_tx_id..end_tx_id)?
-        .map(|value| value.map(|blob| blob.0))
         .collect::<DbResult<Vec<_>>>()?;
-    let tx_outputs = tables
+    let tx_outputs_range = tables
         .tx_outputs_iter()
         .get_range(first_tx_id..end_tx_id)?
-        .map(|value| value.map(|indices| indices.0))
         .collect::<DbResult<Vec<_>>>()?;
 
     let expected_tx_count = usize::try_from(end_tx_id.saturating_sub(first_tx_id))
         .expect("transaction IDs fit in usize");
-    if tx_blobs.len() != expected_tx_count || tx_outputs.len() != expected_tx_count {
-        return Err(RuntimeError::Io(std::io::Error::other(format!(
-            "wallet scan range transaction interval mismatch: heights={start_height}..{end_height} tx_ids={first_tx_id}..{end_tx_id} expected={expected_tx_count} blobs={} outputs={}",
-            tx_blobs.len(),
-            tx_outputs.len(),
-        ))));
-    }
+    let tx_ranges_valid = tx_blobs_range.len() == expected_tx_count
+        && tx_outputs_range.len() == expected_tx_count
+        && tx_blobs_range
+            .iter()
+            .enumerate()
+            .all(|(offset, (key, _))| *key == first_tx_id.saturating_add(offset as u64))
+        && tx_outputs_range
+            .iter()
+            .enumerate()
+            .all(|(offset, (key, _))| *key == first_tx_id.saturating_add(offset as u64));
+    let (tx_blobs, tx_outputs) = if tx_ranges_valid {
+        (
+            tx_blobs_range
+                .into_iter()
+                .map(|(_, blob)| blob.0)
+                .collect(),
+            tx_outputs_range
+                .into_iter()
+                .map(|(_, indices)| indices.0)
+                .collect(),
+        )
+    } else {
+        let mut blobs = Vec::with_capacity(expected_tx_count);
+        let mut outputs = Vec::with_capacity(expected_tx_count);
+        for tx_id in first_tx_id..end_tx_id {
+            blobs.push(tables.tx_blobs().get(&tx_id)?.0);
+            outputs.push(tables.tx_outputs().get(&tx_id)?.0);
+        }
+        (blobs, outputs)
+    };
 
     let mut blocks = Vec::with_capacity(block_infos.len());
     let mut output_indices = Vec::with_capacity(block_infos.len());
@@ -468,6 +517,7 @@ pub fn get_wallet_scan_range(
     Ok(WalletScanRange {
         blocks,
         output_indices,
+        used_ordered_ranges: metadata_ranges_valid && tx_ranges_valid,
     })
 }
 

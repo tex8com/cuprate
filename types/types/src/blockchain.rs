@@ -34,6 +34,10 @@ pub struct WalletScanRange {
     /// Per-block output indices. The inner order is miner transaction first,
     /// followed by the block's ordinary transactions.
     pub output_indices: Vec<Vec<Vec<u64>>>,
+    /// `true` only when every relevant table supplied a verified contiguous
+    /// numeric range. Legacy databases created without numeric comparators
+    /// fall back safely to point reads.
+    pub used_ordered_ranges: bool,
 }
 
 //---------------------------------------------------------------------------------------------------- ReadRequest

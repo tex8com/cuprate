@@ -69,13 +69,13 @@ impl<T: Table + 'static> DatabaseIter<T> for RedbTableRo<T::Key, T::Value> {
     fn get_range<'a, Range>(
         &'a self,
         range: Range,
-    ) -> DbResult<impl Iterator<Item = DbResult<T::Value>> + 'a>
+    ) -> DbResult<impl Iterator<Item = DbResult<(T::Key, T::Value)>> + 'a>
     where
         Range: RangeBounds<T::Key> + 'a,
     {
         Ok(ReadableTable::range(self, range)?.map(|result| {
-            let (_key, value) = result?;
-            Ok(value.value())
+            let (key, value) = result?;
+            Ok((key.value(), value.value()))
         }))
     }
 

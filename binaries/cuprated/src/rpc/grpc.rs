@@ -242,9 +242,10 @@ async fn fetch_chunk(
 
     let want = chunk_blocks.min(target_end - start);
     let t_fetch = Instant::now();
-    let range_read = sync_range_reads_enabled();
-    let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics) = if range_read {
-        let (blocks, output_indices, fetch_metrics, index_metrics) =
+    let range_requested = sync_range_reads_enabled();
+    let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics, range_read) =
+        if range_requested {
+            let (blocks, output_indices, fetch_metrics, index_metrics, range_read) =
             bin_handlers::capped_wallet_scan_range_with_metrics(
                 &mut state,
                 start,
@@ -256,14 +257,15 @@ async fn fetch_chunk(
                 MAX_GRPC_CHUNK_TX_COUNT,
             )
             .await?;
-        (
-            blocks,
-            fetch_metrics,
-            Some(output_indices),
-            Some(index_metrics),
-        )
-    } else {
-        let (blocks, fetch_metrics) = bin_handlers::capped_block_complete_entries_with_metrics(
+            (
+                blocks,
+                fetch_metrics,
+                Some(output_indices),
+                Some(index_metrics),
+                range_read,
+            )
+        } else {
+            let (blocks, fetch_metrics) = bin_handlers::capped_block_complete_entries_with_metrics(
             &mut state,
             start,
             chain_height,
@@ -272,9 +274,9 @@ async fn fetch_chunk(
             MAX_GRPC_CHUNK_RESPONSE_BYTES,
             MAX_GRPC_CHUNK_TX_COUNT,
         )
-        .await?;
-        (blocks, fetch_metrics, None, None)
-    };
+            .await?;
+            (blocks, fetch_metrics, None, None, false)
+        };
 
     Ok(Some(FetchedChunk {
         top_h,
