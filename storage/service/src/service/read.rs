@@ -1,6 +1,7 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::channel::oneshot;
@@ -9,6 +10,11 @@ use tower::Service;
 
 use cuprate_database::{ConcreteEnv, DbResult, RuntimeError};
 use cuprate_helper::asynch::InfallibleOneshotReceiver;
+
+fn sync_db_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CUPRATE_SYNC_DB_TRACE").is_some())
+}
 
 /// The [`rayon::ThreadPool`] service.
 ///
@@ -80,6 +86,9 @@ where
         let (response_sender, receiver) = oneshot::channel();
 
         let handler = Arc::clone(&self.inner_handler);
+        let submitted_at = Instant::now();
+        let trace_db_queue = sync_db_trace_enabled();
+        let request_type = std::any::type_name::<Req>();
 
         // Spawn the request in the rayon DB thread-pool.
         //
@@ -87,7 +96,19 @@ where
         // such that any `rayon` parallel code that runs within
         // the passed closure uses the same `rayon` threadpool.
         self.pool.spawn(move || {
-            drop(response_sender.send(handler(req)));
+            let queue_ms = submitted_at.elapsed().as_secs_f64() * 1000.0;
+            let execution_started_at = Instant::now();
+            let response = handler(req);
+            let execution_ms = execution_started_at.elapsed().as_secs_f64() * 1000.0;
+
+            if trace_db_queue {
+                eprintln!(
+                    "[SYNC_TRACE_DB] request_type={} queue_ms={:.3} execution_ms={:.3}",
+                    request_type, queue_ms, execution_ms,
+                );
+            }
+
+            drop(response_sender.send(response));
         });
 
         InfallibleOneshotReceiver::from(receiver)

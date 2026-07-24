@@ -21,6 +21,21 @@ use crate::{
     AltBlockInformation, BlockCompleteEntry, ChainId, OutputDistributionInput, TxInBlockchain,
 };
 
+//---------------------------------------------------------------------------------------------------- Wallet scan range
+/// Canonical blockchain material needed to construct one wallet-sync range.
+///
+/// This is deliberately an internal storage response: transaction IDs remain
+/// server-only and the existing RPC payload is constructed from the ordinary
+/// [`BlockCompleteEntry`]s plus their output-index vectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletScanRange {
+    /// Complete, unpruned blocks in ascending height order.
+    pub blocks: Vec<BlockCompleteEntry>,
+    /// Per-block output indices. The inner order is miner transaction first,
+    /// followed by the block's ordinary transactions.
+    pub output_indices: Vec<Vec<Vec<u64>>>,
+}
+
 //---------------------------------------------------------------------------------------------------- ReadRequest
 /// A read request to the blockchain database.
 ///
@@ -41,6 +56,17 @@ pub enum BlockchainReadRequest {
     ///
     /// The input is the block heights.
     BlockCompleteEntriesByHeight(Vec<usize>),
+
+    /// Request a consecutive, unpruned wallet-scan range.
+    ///
+    /// The range is half-open (`start_height..end_height`). Implementations
+    /// should use ordered table iteration rather than independent lookups.
+    WalletScanRange {
+        /// First requested block height, inclusive.
+        start_height: usize,
+        /// End height, exclusive.
+        end_height: usize,
+    },
 
     /// Same as above but returns pruned TX blobs.
     BlockCompleteEntriesByHeightPruned(Vec<usize>),
@@ -269,6 +295,9 @@ pub enum BlockchainResponse {
 
     /// Response to [`BlockchainReadRequest::BlockCompleteEntriesByHeight`].
     BlockCompleteEntriesByHeight(Vec<BlockCompleteEntry>),
+
+    /// Response to [`BlockchainReadRequest::WalletScanRange`].
+    WalletScanRange(WalletScanRange),
 
     /// Response to [`BlockchainReadRequest::BlockExtendedHeader`].
     ///

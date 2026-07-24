@@ -10,7 +10,7 @@ use monero_oxide::{
 };
 
 use cuprate_database::{
-    DbResult, RuntimeError, StorableVec, {DatabaseRo, DatabaseRw},
+    DbResult, RuntimeError, StorableVec, {DatabaseIter, DatabaseRo, DatabaseRw},
 };
 use cuprate_fixed_bytes::ByteArray;
 use cuprate_helper::cast::usize_to_u64;
@@ -21,6 +21,7 @@ use cuprate_helper::{
 use cuprate_types::{
     AltBlockInformation, BlockCompleteEntry, ChainId, ExtendedBlockHeader, HardFork,
     PrunedTxBlobEntry, TransactionBlobs, VerifiedBlockInformation, VerifiedTransactionInformation,
+    blockchain::WalletScanRange,
 };
 
 use crate::{
@@ -263,7 +264,7 @@ pub fn get_block_blob_with_tx_indexes(
 #[doc = doc_error!()]
 pub fn get_block_complete_entry(
     block_hash: &BlockHash,
-    tables: &impl TablesIter,
+    tables: &impl Tables,
 ) -> Result<BlockCompleteEntry, RuntimeError> {
     let block_height = tables.block_heights().get(block_hash)?;
     get_block_complete_entry_from_height(&block_height, tables)
@@ -274,7 +275,7 @@ pub fn get_block_complete_entry(
 #[doc = doc_error!()]
 pub fn get_block_complete_entry_from_height(
     block_height: &BlockHeight,
-    tables: &impl TablesIter,
+    tables: &impl Tables,
 ) -> Result<BlockCompleteEntry, RuntimeError> {
     let (block_blob, miner_tx_idx, numb_non_miner_txs) =
         get_block_blob_with_tx_indexes(block_height, tables)?;
@@ -297,10 +298,141 @@ pub fn get_block_complete_entry_from_height(
     })
 }
 
+/// Read a consecutive wallet-sync range with ordered table iteration.
+///
+/// The canonical tables are unchanged. The important difference from the
+/// legacy path is that every height- and transaction-ID keyed table is opened
+/// once and traversed in key order. `TxIds` (hash -> ID) is intentionally not
+/// touched: `BlockInfo::mining_tx_index` plus the block transaction count
+/// already determine the contiguous transaction-ID interval.
+#[doc = doc_error!()]
+pub fn get_wallet_scan_range(
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    tables: &impl TablesIter,
+) -> Result<WalletScanRange, RuntimeError> {
+    if start_height >= end_height {
+        return Ok(WalletScanRange {
+            blocks: vec![],
+            output_indices: vec![],
+        });
+    }
+
+    let block_infos = tables
+        .block_infos_iter()
+        .get_range(start_height..end_height)?
+        .collect::<DbResult<Vec<_>>>()?;
+    let block_headers = tables
+        .block_header_blobs_iter()
+        .get_range(start_height..end_height)?
+        .collect::<DbResult<Vec<_>>>()?;
+    let block_tx_hashes = tables
+        .block_txs_hashes_iter()
+        .get_range(start_height..end_height)?
+        .collect::<DbResult<Vec<_>>>()?;
+
+    if block_infos.len() != block_headers.len() || block_infos.len() != block_tx_hashes.len() {
+        return Err(RuntimeError::KeyNotFound);
+    }
+
+    let Some(first_info) = block_infos.first() else {
+        return Ok(WalletScanRange {
+            blocks: vec![],
+            output_indices: vec![],
+        });
+    };
+    let Some(last_info) = block_infos.last() else {
+        unreachable!();
+    };
+    let last_non_miner_txs = block_tx_hashes
+        .last()
+        .expect("length checked above")
+        .0
+        .len();
+    let first_tx_id = first_info.mining_tx_index;
+    let end_tx_id = last_info
+        .mining_tx_index
+        .saturating_add(1)
+        .saturating_add(usize_to_u64(last_non_miner_txs));
+
+    let tx_blobs = tables
+        .tx_blobs_iter()
+        .get_range(first_tx_id..end_tx_id)?
+        .map(|value| value.map(|blob| blob.0))
+        .collect::<DbResult<Vec<_>>>()?;
+    let tx_outputs = tables
+        .tx_outputs_iter()
+        .get_range(first_tx_id..end_tx_id)?
+        .map(|value| value.map(|indices| indices.0))
+        .collect::<DbResult<Vec<_>>>()?;
+
+    let expected_tx_count = usize::try_from(end_tx_id.saturating_sub(first_tx_id))
+        .expect("transaction IDs fit in usize");
+    if tx_blobs.len() != expected_tx_count || tx_outputs.len() != expected_tx_count {
+        return Err(RuntimeError::KeyNotFound);
+    }
+
+    let mut blocks = Vec::with_capacity(block_infos.len());
+    let mut output_indices = Vec::with_capacity(block_infos.len());
+    let mut tx_offset = 0_usize;
+    let mut expected_tx_id = first_tx_id;
+
+    for ((block_info, block_header), tx_hashes) in block_infos
+        .into_iter()
+        .zip(block_headers)
+        .zip(block_tx_hashes)
+    {
+        if block_info.mining_tx_index != expected_tx_id {
+            // `add_block` writes the miner followed by all ordinary
+            // transactions. A broken interval must use the safe legacy path,
+            // never return mis-associated output indices.
+            return Err(RuntimeError::KeyNotFound);
+        }
+
+        let tx_count = tx_hashes.0.len().saturating_add(1);
+        let tx_end = tx_offset.saturating_add(tx_count);
+        let Some(miner_blob) = tx_blobs.get(tx_offset).cloned() else {
+            return Err(RuntimeError::KeyNotFound);
+        };
+        let mut block = block_header.0;
+        block.extend_from_slice(&miner_blob);
+        monero_oxide::io::VarInt::write(&tx_hashes.0.len(), &mut block)
+            .expect("The number of txs per block will not exceed u64::MAX");
+        block.extend_from_slice(bytemuck::must_cast_slice(&tx_hashes.0));
+
+        let normal_txs = tx_blobs
+            .get(tx_offset.saturating_add(1)..tx_end)
+            .ok_or(RuntimeError::KeyNotFound)?
+            .iter()
+            .cloned()
+            .map(Bytes::from)
+            .collect();
+        let block_outputs = tx_outputs
+            .get(tx_offset..tx_end)
+            .ok_or(RuntimeError::KeyNotFound)?
+            .to_vec();
+
+        blocks.push(BlockCompleteEntry {
+            pruned: false,
+            block: Bytes::from(block),
+            block_weight: 0,
+            txs: TransactionBlobs::Normal(normal_txs),
+        });
+        output_indices.push(block_outputs);
+        tx_offset = tx_end;
+        expected_tx_id = expected_tx_id.saturating_add(usize_to_u64(tx_count));
+    }
+
+    Ok(WalletScanRange {
+        blocks,
+        output_indices,
+    })
+}
+
 /// On-the-fly pruned block entry with real TransactionBlobs::Pruned format.
 pub fn get_block_complete_entry_from_height_pruned(
     block_height: &BlockHeight,
-    tables: &impl TablesIter,
+    tables: &impl Tables,
 ) -> Result<BlockCompleteEntry, RuntimeError> {
     let (block_blob, miner_tx_idx, numb_non_miner_txs) =
         get_block_blob_with_tx_indexes(block_height, tables)?;
@@ -553,6 +685,26 @@ mod test {
                 cumulative_generated_coins(&2, tables.block_infos()).unwrap(),
                 generated_coins_sum,
             );
+
+            // The 1B range reader must return byte-identical block entries
+            // and the same per-transaction output indices as the legacy
+            // independent lookup path.
+            let wallet_scan = get_wallet_scan_range(0, blocks.len(), &tables).unwrap();
+            assert_eq!(wallet_scan.blocks.len(), blocks.len());
+            assert_eq!(wallet_scan.output_indices.len(), blocks.len());
+            for height in 0..blocks.len() {
+                assert_eq!(
+                    wallet_scan.blocks[height],
+                    get_block_complete_entry_from_height(&height, &tables).unwrap()
+                );
+                let info = get_block_info(&height, tables.block_infos()).unwrap();
+                let tx_count = tables.block_txs_hashes().get(&height).unwrap().0.len() + 1;
+                let expected_indices = (info.mining_tx_index
+                    ..info.mining_tx_index + usize_to_u64(tx_count))
+                    .map(|tx_id| tables.tx_outputs().get(&tx_id).unwrap().0)
+                    .collect::<Vec<_>>();
+                assert_eq!(wallet_scan.output_indices[height], expected_indices);
+            }
 
             // Both height and hash should result in getting the same data.
             let mut block_hashes = vec![];

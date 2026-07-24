@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Error};
 use cuprate_constants::rpc::{
-    GET_BLOCKS_BIN_MAX_BLOCK_COUNT, GET_BLOCKS_BIN_MAX_TX_COUNT, RESTRICTED_BLOCK_COUNT,
-    RESTRICTED_TRANSACTIONS_COUNT,
+    GET_BLOCKS_BIN_LEGACY_DEFAULT_BLOCK_COUNT, GET_BLOCKS_BIN_MAX_BLOCK_COUNT,
+    GET_BLOCKS_BIN_MAX_TX_COUNT, RESTRICTED_BLOCK_COUNT, RESTRICTED_TRANSACTIONS_COUNT,
 };
 use cuprate_fixed_bytes::ByteArrayVec;
 use cuprate_helper::cast::{u64_to_usize, usize_to_u64};
@@ -41,6 +41,34 @@ use crate::rpc::{
 
 pub(crate) const GET_BLOCKS_BIN_MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 const GET_BLOCKS_BIN_FETCH_BATCH: usize = 1000;
+
+/// Per-request timings for the block-entry retrieval portion of a wallet-sync
+/// response.  Kept separate from the legacy RPC response so instrumentation
+/// cannot change its wire format or behaviour.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlockFetchMetrics {
+    pub batch_count: usize,
+    pub height_vector_ms: f64,
+    pub database_ms: f64,
+    pub cap_and_collect_ms: f64,
+    pub returned_blocks: usize,
+    pub returned_txs: usize,
+    pub estimated_response_bytes: usize,
+    pub limited_by_response_size: bool,
+    pub limited_by_tx_count: bool,
+}
+
+/// Per-request timings for construction of output-index data.  These fields
+/// make parsing, database lookup and reconstruction independently visible.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OutputIndicesMetrics {
+    pub parse_ms: f64,
+    pub database_ms: f64,
+    pub reconstruct_ms: f64,
+    pub blocks: usize,
+    pub transactions: usize,
+    pub output_index_values: usize,
+}
 
 /// Map a [`BinRequest`] to the function that will lead to a [`BinResponse`].
 pub async fn map_request(
@@ -169,11 +197,7 @@ async fn get_blocks(
         }
     }
 
-    let max_blocks = if max_block_count == 0 {
-        GET_BLOCKS_BIN_MAX_BLOCK_COUNT
-    } else {
-        max_block_count.min(GET_BLOCKS_BIN_MAX_BLOCK_COUNT)
-    };
+    let max_blocks = effective_get_blocks_limit(max_block_count);
 
     let (first_known_height, chain_height) = if !block_hashes.is_empty() || start_height == 0 {
         let n_hashes = block_hashes.len();
@@ -210,7 +234,7 @@ async fn get_blocks(
         .min(u64_to_usize(max_blocks));
 
     let t_blocks = Instant::now();
-    let blocks = capped_block_complete_entries(
+    let (blocks, block_metrics) = capped_block_complete_entries_with_metrics(
         &mut state,
         response_start_height,
         chain_height,
@@ -233,10 +257,29 @@ async fn get_blocks(
         blocks.len()
     );
     let t_oi = Instant::now();
-    let output_indices = output_indices_for_blocks(&mut state, &blocks, no_miner_tx).await?;
+    let (output_indices, index_metrics) =
+        output_indices_for_blocks_with_metrics(&mut state, &blocks, no_miner_tx).await?;
     eprintln!(
         "[TIMING] output_indices_total: {:.1}ms",
         t_oi.elapsed().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "[SYNC_TRACE_SERVER_BIN_BLOCKS] start={} n_blocks={} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={}",
+        response_start_height,
+        blocks.len(),
+        t_blocks.elapsed().as_secs_f64() * 1000.0,
+        block_metrics.batch_count,
+        block_metrics.height_vector_ms,
+        block_metrics.database_ms,
+        block_metrics.cap_and_collect_ms,
+        block_metrics.returned_txs,
+        block_metrics.estimated_response_bytes,
+        t_oi.elapsed().as_secs_f64() * 1000.0,
+        index_metrics.parse_ms,
+        index_metrics.database_ms,
+        index_metrics.reconstruct_ms,
+        index_metrics.transactions,
+        index_metrics.output_index_values,
     );
 
     Ok(GetBlocksResponse {
@@ -246,6 +289,30 @@ async fn get_blocks(
         output_indices,
         ..resp
     })
+}
+
+fn effective_get_blocks_limit(max_block_count: u64) -> u64 {
+    if max_block_count == 0 {
+        GET_BLOCKS_BIN_LEGACY_DEFAULT_BLOCK_COUNT
+    } else {
+        max_block_count.min(GET_BLOCKS_BIN_MAX_BLOCK_COUNT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_get_blocks_limit;
+
+    #[test]
+    fn getblocks_zero_uses_monero_legacy_default() {
+        assert_eq!(effective_get_blocks_limit(0), 1_000);
+    }
+
+    #[test]
+    fn getblocks_explicit_limit_is_preserved_up_to_cuprate_ceiling() {
+        assert_eq!(effective_get_blocks_limit(750), 750);
+        assert_eq!(effective_get_blocks_limit(20_000), 10_000);
+    }
 }
 
 fn split_pool_info(
@@ -287,7 +354,30 @@ pub(crate) async fn capped_block_complete_entries(
     max_response_bytes: usize,
     max_tx_count: usize,
 ) -> Result<Vec<BlockCompleteEntry>, Error> {
+    let (blocks, _) = capped_block_complete_entries_with_metrics(
+        state,
+        response_start_height,
+        chain_height,
+        block_count,
+        prune,
+        max_response_bytes,
+        max_tx_count,
+    )
+    .await?;
+    Ok(blocks)
+}
+
+pub(crate) async fn capped_block_complete_entries_with_metrics(
+    state: &mut CupratedRpcHandler,
+    response_start_height: usize,
+    chain_height: usize,
+    block_count: usize,
+    prune: bool,
+    max_response_bytes: usize,
+    max_tx_count: usize,
+) -> Result<(Vec<BlockCompleteEntry>, BlockFetchMetrics), Error> {
     let mut blocks = Vec::new();
+    let mut metrics = BlockFetchMetrics::default();
     let mut response_bytes = 0_usize;
     let mut tx_count = 0_usize;
     let mut next_height = response_start_height;
@@ -296,10 +386,14 @@ pub(crate) async fn capped_block_complete_entries(
         .min(chain_height);
 
     while next_height < end_height {
+        let t_heights = Instant::now();
         let batch_end = next_height
             .saturating_add(GET_BLOCKS_BIN_FETCH_BATCH)
             .min(end_height);
         let heights = (next_height..batch_end).map(usize_to_u64).collect();
+        metrics.height_vector_ms += t_heights.elapsed().as_secs_f64() * 1000.0;
+        metrics.batch_count += 1;
+        let t_database = Instant::now();
         let batch = if prune {
             blockchain::block_complete_entries_by_height_pruned(&mut state.blockchain_read, heights)
                 .await?
@@ -307,7 +401,9 @@ pub(crate) async fn capped_block_complete_entries(
             blockchain::block_complete_entries_by_height(&mut state.blockchain_read, heights)
                 .await?
         };
+        metrics.database_ms += t_database.elapsed().as_secs_f64() * 1000.0;
 
+        let t_collect = Instant::now();
         for block in batch {
             let block_response_bytes = block_response_bytes(&block);
             let block_tx_count = block.txs.len();
@@ -316,18 +412,121 @@ pub(crate) async fn capped_block_complete_entries(
                 && (response_bytes.saturating_add(block_response_bytes) > max_response_bytes
                     || tx_count.saturating_add(block_tx_count) > max_tx_count)
             {
-                return Ok(blocks);
+                metrics.cap_and_collect_ms += t_collect.elapsed().as_secs_f64() * 1000.0;
+                metrics.returned_blocks = blocks.len();
+                metrics.returned_txs = tx_count;
+                metrics.estimated_response_bytes = response_bytes;
+                metrics.limited_by_response_size =
+                    response_bytes.saturating_add(block_response_bytes) > max_response_bytes;
+                metrics.limited_by_tx_count =
+                    tx_count.saturating_add(block_tx_count) > max_tx_count;
+                return Ok((blocks, metrics));
             }
 
             response_bytes = response_bytes.saturating_add(block_response_bytes);
             tx_count = tx_count.saturating_add(block_tx_count);
             blocks.push(block);
         }
+        metrics.cap_and_collect_ms += t_collect.elapsed().as_secs_f64() * 1000.0;
 
         next_height = batch_end;
     }
 
-    Ok(blocks)
+    metrics.returned_blocks = blocks.len();
+    metrics.returned_txs = tx_count;
+    metrics.estimated_response_bytes = response_bytes;
+    Ok((blocks, metrics))
+}
+
+/// Construct one wallet-sync response range directly from height-ordered
+/// blockchain tables. This is the 1B fast path: it avoids reparsing blocks to
+/// recover transaction hashes and avoids the `TxIds` hash-to-ID lookup table.
+/// The returned blocks and index vectors remain wire-compatible with the
+/// ordinary `/get_blocks.bin` response.
+pub(crate) async fn capped_wallet_scan_range_with_metrics(
+    state: &mut CupratedRpcHandler,
+    response_start_height: usize,
+    chain_height: usize,
+    block_count: usize,
+    no_miner_tx: bool,
+    max_response_bytes: usize,
+    max_tx_count: usize,
+) -> Result<
+    (
+        Vec<BlockCompleteEntry>,
+        Vec<BlockOutputIndices>,
+        BlockFetchMetrics,
+        OutputIndicesMetrics,
+    ),
+    Error,
+> {
+    let end_height = response_start_height
+        .saturating_add(block_count)
+        .min(chain_height);
+    let t_database = Instant::now();
+    let range = blockchain::wallet_scan_range(
+        &mut state.blockchain_read,
+        response_start_height,
+        end_height,
+    )
+    .await?;
+    let database_ms = t_database.elapsed().as_secs_f64() * 1000.0;
+
+    let mut fetch_metrics = BlockFetchMetrics {
+        batch_count: 1,
+        database_ms,
+        ..BlockFetchMetrics::default()
+    };
+    let mut index_metrics = OutputIndicesMetrics {
+        blocks: range.blocks.len(),
+        ..OutputIndicesMetrics::default()
+    };
+    let mut blocks = Vec::with_capacity(range.blocks.len());
+    let mut output_indices = Vec::with_capacity(range.blocks.len());
+    let mut response_bytes = 0_usize;
+    let mut tx_count = 0_usize;
+    let t_collect = Instant::now();
+
+    for (block, raw_indices) in range.blocks.into_iter().zip(range.output_indices) {
+        let block_response_bytes = block_response_bytes(&block);
+        let block_tx_count = block.txs.len();
+        if !blocks.is_empty()
+            && (response_bytes.saturating_add(block_response_bytes) > max_response_bytes
+                || tx_count.saturating_add(block_tx_count) > max_tx_count)
+        {
+            fetch_metrics.limited_by_response_size =
+                response_bytes.saturating_add(block_response_bytes) > max_response_bytes;
+            fetch_metrics.limited_by_tx_count =
+                tx_count.saturating_add(block_tx_count) > max_tx_count;
+            break;
+        }
+
+        let mut per_block = Vec::with_capacity(raw_indices.len());
+        for (position, indices) in raw_indices.into_iter().enumerate() {
+            if no_miner_tx && position == 0 {
+                per_block.push(TxOutputIndices { indices: vec![] });
+            } else {
+                index_metrics.transactions = index_metrics.transactions.saturating_add(1);
+                index_metrics.output_index_values = index_metrics
+                    .output_index_values
+                    .saturating_add(indices.len());
+                per_block.push(TxOutputIndices { indices });
+            }
+        }
+
+        response_bytes = response_bytes.saturating_add(block_response_bytes);
+        tx_count = tx_count.saturating_add(block_tx_count);
+        blocks.push(block);
+        output_indices.push(BlockOutputIndices { indices: per_block });
+    }
+
+    fetch_metrics.cap_and_collect_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
+    fetch_metrics.returned_blocks = blocks.len();
+    fetch_metrics.returned_txs = tx_count;
+    fetch_metrics.estimated_response_bytes = response_bytes;
+    index_metrics.reconstruct_ms = fetch_metrics.cap_and_collect_ms;
+
+    Ok((blocks, output_indices, fetch_metrics, index_metrics))
 }
 
 fn block_response_bytes(block: &BlockCompleteEntry) -> usize {
@@ -352,7 +551,21 @@ pub(crate) async fn output_indices_for_blocks(
     blocks: &[BlockCompleteEntry],
     no_miner_tx: bool,
 ) -> Result<Vec<BlockOutputIndices>, Error> {
+    let (output_indices, _) =
+        output_indices_for_blocks_with_metrics(state, blocks, no_miner_tx).await?;
+    Ok(output_indices)
+}
+
+pub(crate) async fn output_indices_for_blocks_with_metrics(
+    state: &mut CupratedRpcHandler,
+    blocks: &[BlockCompleteEntry],
+    no_miner_tx: bool,
+) -> Result<(Vec<BlockOutputIndices>, OutputIndicesMetrics), Error> {
     let t_idx = Instant::now();
+    let mut metrics = OutputIndicesMetrics {
+        blocks: blocks.len(),
+        ..OutputIndicesMetrics::default()
+    };
 
     // Parse all blocks and collect all tx hashes for a single batch lookup
     let mut all_blocks_parsed = Vec::with_capacity(blocks.len());
@@ -370,6 +583,8 @@ pub(crate) async fn output_indices_for_blocks(
     }
 
     let total_txs = all_tx_hashes.len();
+    metrics.transactions = total_txs;
+    metrics.parse_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[TIMING] index_parse: {:.1}ms ({} blocks, {} txs)",
         t_idx.elapsed().as_secs_f64() * 1000.0,
@@ -381,6 +596,7 @@ pub(crate) async fn output_indices_for_blocks(
     let t_db = Instant::now();
     let all_indices =
         blockchain::tx_output_indexes_batch(&mut state.blockchain_read, all_tx_hashes).await?;
+    metrics.database_ms = t_db.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[TIMING] index_db_batch: {:.1}ms ({} lookups)",
         t_db.elapsed().as_secs_f64() * 1000.0,
@@ -388,6 +604,7 @@ pub(crate) async fn output_indices_for_blocks(
     );
 
     // Reconstruct per-block output indices
+    let t_reconstruct = Instant::now();
     let mut idx = 0;
     let mut output_indices = Vec::with_capacity(blocks.len());
     for parsed_block in &all_blocks_parsed {
@@ -413,12 +630,14 @@ pub(crate) async fn output_indices_for_blocks(
             indices: block_indices,
         });
     }
+    metrics.reconstruct_ms = t_reconstruct.elapsed().as_secs_f64() * 1000.0;
+    metrics.output_index_values = all_indices.iter().map(Vec::len).sum();
 
     eprintln!(
         "[TIMING] index_total: {:.1}ms",
         t_idx.elapsed().as_secs_f64() * 1000.0
     );
-    Ok(output_indices)
+    Ok((output_indices, metrics))
 }
 
 /// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L817-L857>
@@ -463,7 +682,9 @@ async fn get_hashes(
         use cuprate_types::blockchain::BlockchainResponse;
         use tower::{Service, ServiceExt};
 
+        let t_chain_height = Instant::now();
         let (tip_height, _) = blockchain::chain_height(&mut state.blockchain_read).await?;
+        let chain_height_ms = t_chain_height.elapsed().as_secs_f64() * 1000.0;
         if start_height >= tip_height {
             return Ok(GetHashesResponse {
                 base: helper::access_response_base(false),
@@ -479,6 +700,7 @@ async fn get_hashes(
         let end = start + u64_to_usize(count);
 
         // Single service call, server-side LMDB batch read (parallelised via rayon)
+        let t_range = Instant::now();
         let BlockchainResponse::BlockHashInRange(hashes) = state
             .blockchain_read
             .ready()
@@ -491,6 +713,7 @@ async fn get_hashes(
         else {
             return Err(anyhow!("unexpected blockchain response"));
         };
+        let range_ms = t_range.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!(
             "[RPC] GetHashes DIRECT-BULK: h={} count={} actual={} total_ms={:.1}",
@@ -498,6 +721,15 @@ async fn get_hashes(
             count,
             hashes.len(),
             t_total.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[SYNC_TRACE_SERVER_BIN_HASH] mode=direct_bulk start={} requested={} hashes={} chain_height_ms={:.3} range_db_ms={:.3} total_ms={:.3}",
+            start_height,
+            count,
+            hashes.len(),
+            chain_height_ms,
+            range_ms,
+            t_total.elapsed().as_secs_f64() * 1000.0,
         );
         return Ok(GetHashesResponse {
             base: helper::access_response_base(false),
@@ -520,12 +752,15 @@ async fn get_hashes(
 
     let hashes: Vec<[u8; 32]> = (&block_ids).into();
 
+    let hash_count = hashes.len();
+    let t_chain = Instant::now();
     let (m_block_ids, first_known_height, current_height) = blockchain::next_chain_entry(
         &mut state.blockchain_read,
         hashes,
         GET_BLOCKS_BIN_MAX_BLOCK_COUNT,
     )
     .await?;
+    let chain_lookup_ms = t_chain.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[RPC] GetHashes: got {} hashes, first_known={:?}, current_height={}",
         m_block_ids.len(),
@@ -540,6 +775,14 @@ async fn get_hashes(
         m_block_ids.len(),
         first_known_height,
         t_total.elapsed().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "[SYNC_TRACE_SERVER_BIN_HASH] mode=chain_match request_hashes={} response_hashes={} start={} chain_lookup_ms={:.3} total_ms={:.3}",
+        hash_count,
+        m_block_ids.len(),
+        first_known_height,
+        chain_lookup_ms,
+        t_total.elapsed().as_secs_f64() * 1000.0,
     );
     Ok(GetHashesResponse {
         base: helper::access_response_base(false),

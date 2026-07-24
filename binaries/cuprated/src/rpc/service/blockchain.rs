@@ -14,7 +14,7 @@ use cuprate_blockchain::service::BlockchainReadHandle;
 use cuprate_helper::cast::{u64_to_usize, usize_to_u64};
 use cuprate_rpc_types::misc::GetOutputsOut;
 use cuprate_types::{
-    blockchain::{BlockchainReadRequest, BlockchainResponse},
+    blockchain::{BlockchainReadRequest, BlockchainResponse, WalletScanRange},
     output_cache::OutputCache,
     rpc::{
         ChainInfo, CoinbaseTxSum, KeyImageSpentStatus, OutputDistributionData,
@@ -537,6 +537,27 @@ pub async fn block_complete_entries_by_height(
     };
 
     Ok(blocks)
+}
+
+/// Read one consecutive, internally coalesced wallet-sync range.
+pub async fn wallet_scan_range(
+    blockchain_read: &mut BlockchainReadHandle,
+    start_height: usize,
+    end_height: usize,
+) -> Result<WalletScanRange, Error> {
+    let BlockchainResponse::WalletScanRange(range) = blockchain_read
+        .ready()
+        .await?
+        .call(BlockchainReadRequest::WalletScanRange {
+            start_height,
+            end_height,
+        })
+        .await?
+    else {
+        unreachable!();
+    };
+
+    Ok(range)
 }
 
 /// Like [`block_complete_entries_by_height`] but returns pruned TX blobs.

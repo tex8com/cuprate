@@ -11,7 +11,10 @@
 //! plus server-streaming.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Error;
@@ -19,7 +22,10 @@ use cuprate_epee_encoding::to_bytes;
 use cuprate_fixed_bytes::ByteArrayVec;
 use cuprate_helper::cast::{u64_to_usize, usize_to_u64};
 use cuprate_rpc_types::bin::GetBlocksResponse;
-use cuprate_types::rpc::PoolInfoExtent;
+use cuprate_types::{
+    BlockCompleteEntry,
+    rpc::{BlockOutputIndices, PoolInfoExtent},
+};
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -86,6 +92,52 @@ const CHANNEL_CAPACITY: usize = 32;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
 
+fn stream_pipeline_depth() -> usize {
+    static DEPTH: OnceLock<usize> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("CUPRATE_SYNC_PIPELINE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            // The first variant intentionally has one fetch ahead. Wider
+            // pipelines are enabled only after the depth-2 measurement.
+            .clamp(1, 2)
+    })
+}
+
+fn sync_range_reads_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CUPRATE_SYNC_RANGE_READS")
+                .as_deref()
+                .map(str::trim),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        )
+    })
+}
+
+struct FetchedChunk {
+    top_h: u64,
+    chain_height: usize,
+    target_end: usize,
+    start: usize,
+    blocks: Vec<BlockCompleteEntry>,
+    top_ms: f64,
+    fetch_ms: f64,
+    fetch_metrics: bin_handlers::BlockFetchMetrics,
+    prepared_output_indices: Option<Vec<BlockOutputIndices>>,
+    prepared_index_metrics: Option<bin_handlers::OutputIndicesMetrics>,
+    range_read: bool,
+}
+
+struct IndexedChunk {
+    fetched: FetchedChunk,
+    output_indices: Vec<BlockOutputIndices>,
+    idx_ms: f64,
+    index_metrics: bin_handlers::OutputIndicesMetrics,
+}
+
 #[derive(Clone)]
 pub struct BlockStreamService {
     pub handler: CupratedRpcHandler,
@@ -129,9 +181,10 @@ impl BlockStream for BlockStreamService {
             .unwrap_or(0);
 
         eprintln!(
-            "[GRPC StreamBlocks] OPEN id={} client_req_id={} start={} stop={} prune={} no_miner_tx={} chunk_blocks={} max_chunk_bytes={} max_chunk_txs={} active_streams={} open_epoch_ms={}",
+            "[GRPC StreamBlocks] OPEN id={} client_req_id={} start={} stop={} prune={} no_miner_tx={} chunk_blocks={} max_chunk_bytes={} max_chunk_txs={} range_reads={} pipeline_depth={} active_streams={} open_epoch_ms={}",
             server_req_id, client_id_label, start_height, stop_height, prune, no_miner_tx,
-            chunk_blocks, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT, active,
+            chunk_blocks, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT,
+            sync_range_reads_enabled(), stream_pipeline_depth(), active,
             open_epoch_ms,
         );
 
@@ -165,6 +218,111 @@ impl BlockStream for BlockStreamService {
     }
 }
 
+async fn fetch_chunk(
+    mut state: CupratedRpcHandler,
+    start: usize,
+    stop_height: u64,
+    chunk_blocks: usize,
+    prune: bool,
+    no_miner_tx: bool,
+) -> Result<Option<FetchedChunk>, Error> {
+    let t_top = Instant::now();
+    let (top_h, _) = bin_helper::top_height(&mut state).await?;
+    let top_ms = t_top.elapsed().as_secs_f64() * 1000.0;
+    let chain_height = u64_to_usize(top_h) + 1;
+    let target_end = if stop_height == 0 {
+        chain_height
+    } else {
+        (u64_to_usize(stop_height) + 1).min(chain_height)
+    };
+
+    if start >= target_end {
+        return Ok(None);
+    }
+
+    let want = chunk_blocks.min(target_end - start);
+    let t_fetch = Instant::now();
+    let range_read = sync_range_reads_enabled() && !prune;
+    let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics) = if range_read {
+        let (blocks, output_indices, fetch_metrics, index_metrics) =
+            bin_handlers::capped_wallet_scan_range_with_metrics(
+                &mut state,
+                start,
+                chain_height,
+                want,
+                no_miner_tx,
+                MAX_GRPC_CHUNK_RESPONSE_BYTES,
+                MAX_GRPC_CHUNK_TX_COUNT,
+            )
+            .await?;
+        (
+            blocks,
+            fetch_metrics,
+            Some(output_indices),
+            Some(index_metrics),
+        )
+    } else {
+        let (blocks, fetch_metrics) = bin_handlers::capped_block_complete_entries_with_metrics(
+            &mut state,
+            start,
+            chain_height,
+            want,
+            prune,
+            MAX_GRPC_CHUNK_RESPONSE_BYTES,
+            MAX_GRPC_CHUNK_TX_COUNT,
+        )
+        .await?;
+        (blocks, fetch_metrics, None, None)
+    };
+
+    Ok(Some(FetchedChunk {
+        top_h,
+        chain_height,
+        target_end,
+        start,
+        blocks,
+        top_ms,
+        fetch_ms: t_fetch.elapsed().as_secs_f64() * 1000.0,
+        fetch_metrics,
+        prepared_output_indices,
+        prepared_index_metrics,
+        range_read,
+    }))
+}
+
+async fn index_chunk(
+    mut state: CupratedRpcHandler,
+    mut fetched: FetchedChunk,
+    no_miner_tx: bool,
+) -> Result<IndexedChunk, Error> {
+    if let (Some(output_indices), Some(index_metrics)) = (
+        fetched.prepared_output_indices.take(),
+        fetched.prepared_index_metrics.take(),
+    ) {
+        return Ok(IndexedChunk {
+            fetched,
+            output_indices,
+            idx_ms: 0.0,
+            index_metrics,
+        });
+    }
+    let t_idx = Instant::now();
+    let (output_indices, index_metrics) =
+        bin_handlers::output_indices_for_blocks_with_metrics(
+            &mut state,
+            &fetched.blocks,
+            no_miner_tx,
+        )
+        .await?;
+
+    Ok(IndexedChunk {
+        fetched,
+        output_indices,
+        idx_ms: t_idx.elapsed().as_secs_f64() * 1000.0,
+        index_metrics,
+    })
+}
+
 async fn produce_block_stream(
     state: &mut CupratedRpcHandler,
     tx: mpsc::Sender<Result<BlockChunk, Status>>,
@@ -180,17 +338,27 @@ async fn produce_block_stream(
     let mut chunk_seq: u64 = 0;
     let mut total_blocks: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let pipeline_depth = stream_pipeline_depth();
+    let mut prefetched: Option<tokio::task::JoinHandle<Result<Option<FetchedChunk>, Error>>> =
+        None;
 
     loop {
-        let (top_h, _) = bin_helper::top_height(state).await?;
-        let chain_height = u64_to_usize(top_h) + 1;
-        let target_end = if stop_height == 0 {
-            chain_height
-        } else {
-            (u64_to_usize(stop_height) + 1).min(chain_height)
+        let fetched = match prefetched.take() {
+            Some(task) => task.await.map_err(|error| Error::msg(error.to_string()))??,
+            None => {
+                fetch_chunk(
+                    state.clone(),
+                    next_height,
+                    stop_height,
+                    chunk_blocks,
+                    prune,
+                    no_miner_tx,
+                )
+                .await?
+            }
         };
 
-        if next_height >= target_end {
+        let Some(fetched) = fetched else {
             let total_ms = stream_t0.elapsed().as_secs_f64() * 1000.0;
             let avg_mbs = if total_ms > 0.0 {
                 (total_bytes as f64 / 1024.0 / 1024.0) / (total_ms / 1000.0)
@@ -202,23 +370,9 @@ async fn produce_block_stream(
                 server_req_id, chunk_seq, total_blocks, total_bytes, total_ms, avg_mbs,
             );
             return Ok(());
-        }
+        };
 
-        let want = chunk_blocks.min(target_end - next_height);
-
-        let t_db = Instant::now();
-        let blocks = bin_handlers::capped_block_complete_entries(
-            state,
-            next_height,
-            chain_height,
-            want,
-            prune,
-            MAX_GRPC_CHUNK_RESPONSE_BYTES,
-            MAX_GRPC_CHUNK_TX_COUNT,
-        )
-        .await?;
-        let db_ms = t_db.elapsed().as_secs_f64() * 1000.0;
-        let actual_blocks = blocks.len();
+        let actual_blocks = fetched.blocks.len();
 
         if actual_blocks == 0 {
             eprintln!(
@@ -228,15 +382,41 @@ async fn produce_block_stream(
             return Ok(());
         }
 
-        let t_idx = Instant::now();
-        let output_indices =
-            bin_handlers::output_indices_for_blocks(state, &blocks, no_miner_tx).await?;
-        let idx_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+        let following_height = fetched.start + actual_blocks;
+        if pipeline_depth == 2 && following_height < fetched.target_end {
+            let state_for_prefetch = state.clone();
+            prefetched = Some(tokio::spawn(async move {
+                fetch_chunk(
+                    state_for_prefetch,
+                    following_height,
+                    stop_height,
+                    chunk_blocks,
+                    prune,
+                    no_miner_tx,
+                )
+                .await
+            }));
+        }
 
-        let response_start = usize_to_u64(next_height);
+        let indexed = index_chunk(state.clone(), fetched, no_miner_tx).await?;
+        let FetchedChunk {
+            top_h,
+            chain_height,
+            start: response_start,
+            blocks,
+            top_ms,
+            fetch_ms,
+            fetch_metrics,
+            range_read,
+            ..
+        } = indexed.fetched;
+        let output_indices = indexed.output_indices;
+        let idx_ms = indexed.idx_ms;
+        let index_metrics = indexed.index_metrics;
+        let response_start = usize_to_u64(response_start);
         let response_current = usize_to_u64(chain_height);
 
-        let t_enc = Instant::now();
+        let t_response = Instant::now();
         let resp = GetBlocksResponse {
             base: bin_helper::access_response_base(false),
             blocks,
@@ -249,6 +429,8 @@ async fn produce_block_stream(
             remaining_added_pool_txids: ByteArrayVec::default(),
             removed_pool_txids: ByteArrayVec::default(),
         };
+        let response_build_ms = t_response.elapsed().as_secs_f64() * 1000.0;
+        let t_enc = Instant::now();
         let payload_buf = match to_bytes(resp) {
             Ok(b) => b.freeze(),
             Err(e) => {
@@ -262,6 +444,8 @@ async fn produce_block_stream(
         let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
         let payload_len = payload_buf.len();
 
+        let queue_depth_before = CHANNEL_CAPACITY.saturating_sub(tx.capacity());
+        let t_proto_copy = Instant::now();
         let chunk = BlockChunk {
             start_height: response_start,
             chunk_seq,
@@ -271,6 +455,7 @@ async fn produce_block_stream(
             n_blocks: actual_blocks as u32,
             payload_bytes: payload_len as u32,
         };
+        let proto_copy_ms = t_proto_copy.elapsed().as_secs_f64() * 1000.0;
 
         let t_send = Instant::now();
         if tx.send(Ok(chunk)).await.is_err() {
@@ -282,6 +467,7 @@ async fn produce_block_stream(
             return Ok(());
         }
         let send_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+        let queue_depth_after = CHANNEL_CAPACITY.saturating_sub(tx.capacity());
 
         total_blocks += actual_blocks as u64;
         total_bytes += payload_len as u64;
@@ -292,7 +478,7 @@ async fn produce_block_stream(
             0.0
         };
 
-        let upstream_ms = db_ms + idx_ms + enc_ms;
+        let upstream_ms = top_ms + fetch_ms + idx_ms + response_build_ms + enc_ms + proto_copy_ms;
         let bp_ratio = if upstream_ms > 1.0 {
             send_ms / upstream_ms
         } else {
@@ -300,9 +486,17 @@ async fn produce_block_stream(
         };
 
         eprintln!(
-            "[GRPC StreamBlocks] CHUNK id={} seq={} start={} n_blocks={} payload_bytes={} db_ms={:.1} idx_ms={:.1} enc_ms={:.1} send_ms={:.1} bp_ratio={:.2} cum_ms={:.1} cum_bytes={} cum_mbs={:.2} chain_tip={}",
+            "[SYNC_TRACE_SERVER] id={} seq={} start={} n_blocks={} payload_bytes={} range_read={} pipeline_depth={} top_ms={:.3} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} fetch_limit_bytes={} fetch_limit_txs={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={} response_build_ms={:.3} epee_encode_ms={:.3} protobuf_copy_ms={:.3} queue_depth_before={} queue_depth_after={} queue_send_wait_ms={:.3} upstream_ms={:.3} bp_ratio={:.3} cum_ms={:.3} cum_bytes={} cum_mbs={:.3} chain_tip={}",
             server_req_id, chunk_seq, response_start, actual_blocks, payload_len,
-            db_ms, idx_ms, enc_ms, send_ms, bp_ratio,
+            range_read, pipeline_depth,
+            top_ms, fetch_ms, fetch_metrics.batch_count, fetch_metrics.height_vector_ms,
+            fetch_metrics.database_ms, fetch_metrics.cap_and_collect_ms,
+            fetch_metrics.returned_txs, fetch_metrics.estimated_response_bytes,
+            fetch_metrics.limited_by_response_size, fetch_metrics.limited_by_tx_count,
+            idx_ms, index_metrics.parse_ms, index_metrics.database_ms,
+            index_metrics.reconstruct_ms, index_metrics.transactions,
+            index_metrics.output_index_values, response_build_ms, enc_ms, proto_copy_ms,
+            queue_depth_before, queue_depth_after, send_ms, upstream_ms, bp_ratio,
             cum_ms, total_bytes, cum_mbs, top_h,
         );
 

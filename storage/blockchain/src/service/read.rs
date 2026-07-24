@@ -46,7 +46,7 @@ use crate::{
             block_exists, get_block, get_block_blob_with_tx_indexes, get_block_by_hash,
             get_block_complete_entry, get_block_complete_entry_from_height,
             get_block_complete_entry_from_height_pruned, get_block_extended_header_from_height,
-            get_block_height, get_block_info,
+            get_block_height, get_block_info, get_wallet_scan_range,
         },
         blockchain::{cumulative_generated_coins, find_split_point, top_block_height},
         key_image::key_image_exists,
@@ -115,6 +115,10 @@ fn map_request(
     match request {
         R::BlockCompleteEntries(block_hashes) => block_complete_entries(env, block_hashes),
         R::BlockCompleteEntriesByHeight(heights) => block_complete_entries_by_height(env, heights),
+        R::WalletScanRange {
+            start_height,
+            end_height,
+        } => wallet_scan_range(env, start_height, end_height),
         R::BlockCompleteEntriesByHeightPruned(heights) => {
             block_complete_entries_by_height_pruned(env, heights)
         }
@@ -287,6 +291,23 @@ fn block_complete_entries_by_height(
     let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
 
     Ok(BlockchainResponse::BlockCompleteEntriesByHeight(blocks))
+}
+
+/// [`BlockchainReadRequest::WalletScanRange`].
+fn wallet_scan_range(
+    env: &ConcreteEnv,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+) -> ResponseResult {
+    let env_inner = env.env_inner();
+    let tx_ro = env_inner.tx_ro()?;
+    let tables = env_inner.open_tables(&tx_ro)?;
+
+    Ok(BlockchainResponse::WalletScanRange(get_wallet_scan_range(
+        start_height,
+        end_height,
+        &tables,
+    )?))
 }
 
 /// Like [`block_complete_entries_by_height`] but reads pruned TX blobs.
