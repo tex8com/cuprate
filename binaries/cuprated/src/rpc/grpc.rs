@@ -251,13 +251,17 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                     height = existing_end;
                     continue;
                 }
-                let count = usize::try_from(end.saturating_sub(height)).unwrap_or(usize::MAX).min(chunk_blocks);
+                let count = store.builder_block_count(height, end, chunk_blocks);
                 match bin_handlers::capped_wallet_scan_range_with_metrics(
                     &mut state, usize::try_from(height).unwrap(), usize::try_from(end).unwrap(), count,
                     true, false, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT,
                 ).await {
-                    Ok((blocks, output_indices, _, _, _)) => match crate::rpc::scanpack::ScanPack::new(height, blocks, output_indices).and_then(|pack| store.write(&pack)) {
-                        Ok(()) => { built += 1; height = height.saturating_add(u64::try_from(count).unwrap()); if built % 16 == 0 { eprintln!("[SCANPACK] built {built} packs; next_height={height} tip={end}"); } }
+                    Ok((blocks, output_indices, _, _, _)) => match crate::rpc::scanpack::ScanPack::new(height, blocks, output_indices).and_then(|pack| {
+                        let pack_end = pack.end_height;
+                        store.write(&pack)?;
+                        Ok(pack_end)
+                    }) {
+                        Ok(pack_end) => { built += 1; height = pack_end; if built % 16 == 0 { eprintln!("[SCANPACK] built {built} packs; next_height={height} tip={end}"); } }
                         Err(error) => { eprintln!("[SCANPACK] write error at height {height}: {error:#}"); break; }
                     },
                     Err(error) => { eprintln!("[SCANPACK] build error at height {height}: {error:#}"); break; }

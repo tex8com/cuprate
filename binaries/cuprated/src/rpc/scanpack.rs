@@ -88,6 +88,29 @@ impl ScanPackStore {
         self.packs.read().expect("scan pack index lock poisoned").first_key_value().map(|(height, _)| *height)
     }
 
+    /// Return the first physical pack boundary strictly after `height`.
+    ///
+    /// The moving-window builder uses this to make a shortened leading pack
+    /// rather than writing across an already cached boundary.
+    pub fn next_start_after(&self, height: u64) -> Option<u64> {
+        self.packs.read().expect("scan pack index lock poisoned")
+            .range((Bound::Excluded(height), Bound::Unbounded))
+            .next()
+            .map(|(start, _)| *start)
+    }
+
+    /// Bound a builder request so it cannot cross an existing pack boundary.
+    pub fn builder_block_count(&self, height: u64, end: u64, chunk_blocks: usize) -> usize {
+        let mut count = usize::try_from(end.saturating_sub(height))
+            .unwrap_or(usize::MAX)
+            .min(chunk_blocks);
+        if let Some(next_start) = self.next_start_after(height) {
+            let gap = usize::try_from(next_start.saturating_sub(height)).unwrap_or(usize::MAX);
+            count = count.min(gap);
+        }
+        count
+    }
+
     pub fn load_covering(&self, height: u64, max_blocks: usize) -> Result<Option<ScanPack>> {
         let path = self.packs.read().expect("scan pack index lock poisoned")
             .range((Bound::Unbounded, Bound::Included(height))).next_back().map(|(_, path)| path.clone());
@@ -110,6 +133,40 @@ impl ScanPackStore {
     }
 
     pub fn write(&self, pack: &ScanPack) -> Result<()> {
+        let (previous, next_start) = {
+            let packs = self.packs.read().expect("scan pack index lock poisoned");
+            if packs.contains_key(&pack.start_height) {
+                bail!("scan pack already exists at height {}", pack.start_height);
+            }
+            let previous = packs
+                .range((Bound::Unbounded, Bound::Excluded(pack.start_height)))
+                .next_back()
+                .map(|(_, path)| path.clone());
+            let next_start = packs
+                .range((Bound::Excluded(pack.start_height), Bound::Unbounded))
+                .next()
+                .map(|(start, _)| *start);
+            (previous, next_start)
+        };
+        if let Some(path) = previous {
+            let previous = read_pack(&path)?;
+            if previous.end_height > pack.start_height {
+                bail!(
+                    "scan pack at {} overlaps preceding pack ending at {}",
+                    pack.start_height,
+                    previous.end_height
+                );
+            }
+        }
+        if let Some(next_start) = next_start {
+            if pack.end_height > next_start {
+                bail!(
+                    "scan pack ending at {} overlaps following pack at {}",
+                    pack.end_height,
+                    next_start
+                );
+            }
+        }
         let final_path = self.directory.join(format!("pack-{:020}.mwsp", pack.start_height));
         let temporary_path = self.directory.join(format!(".pack-{:020}.tmp", pack.start_height));
         write_pack(&temporary_path, pack)?;
@@ -118,7 +175,7 @@ impl ScanPackStore {
         Ok(())
     }
 
-    /// Delete immutable packs that lie entirely before the retained window.
+    /// Delete immutable packs that start before the retained window.
     pub fn remove_before(&self, height: u64) -> Result<usize> {
         let stale: Vec<_> = self.packs.read().expect("scan pack index lock poisoned")
             .iter().filter_map(|(start, path)| (*start < height).then(|| (*start, path.clone()))).collect();
@@ -188,10 +245,33 @@ fn read_pack(path: &Path) -> Result<ScanPack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack(start_height: u64, count: usize) -> ScanPack {
+        ScanPack::new(
+            start_height,
+            (0..count).map(|_| BlockCompleteEntry::default()).collect(),
+            (0..count).map(|_| BlockOutputIndices { indices: vec![] }).collect(),
+        ).unwrap()
+    }
+
     #[test]
     fn persists_and_slices_pack() {
         let directory = tempfile::tempdir().unwrap(); let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
-        let pack = ScanPack::new(100, vec![BlockCompleteEntry::default(), BlockCompleteEntry::default()], vec![BlockOutputIndices { indices: vec![] }, BlockOutputIndices { indices: vec![] }]).unwrap();
+        let pack = pack(100, 2);
         store.write(&pack).unwrap(); let read = store.load_covering(101, 10).unwrap().unwrap(); assert_eq!(read.start_height, 101); assert_eq!(read.end_height, 102); assert_eq!(read.blocks.len(), 1); assert_eq!(store.covering_end(101).unwrap(), Some(102));
+    }
+
+    #[test]
+    fn preserves_physical_pack_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
+        store.write(&pack(100, 2)).unwrap();
+        store.write(&pack(102, 2)).unwrap();
+
+        assert_eq!(store.next_start_after(100), Some(102));
+        assert_eq!(store.next_start_after(102), None);
+        assert_eq!(store.builder_block_count(101, 200, 1_000), 1);
+        assert!(store.write(&pack(101, 1)).is_err());
+        assert!(store.write(&pack(104, 1)).is_ok());
     }
 }
