@@ -69,6 +69,10 @@ impl ScanPackStore {
             .with_context(|| format!("creating scan pack directory {}", directory.display()))?;
         let store = Arc::new(Self { directory, packs: RwLock::new(BTreeMap::new()) });
         store.refresh()?;
+        let removed = store.remove_overlaps()?;
+        if removed > 0 {
+            eprintln!("[SCANPACK] removed {removed} overlapping cache packs during startup");
+        }
         Ok(store)
     }
 
@@ -175,6 +179,51 @@ impl ScanPackStore {
         Ok(())
     }
 
+    /// Remove redundant overlapping packs before RPC handlers can observe the
+    /// cache. A cache miss is always safe, so retaining the longest suffix is
+    /// preferable to serving a structurally ambiguous sidecar after an older
+    /// builder version left overlapping files behind.
+    fn remove_overlaps(&self) -> Result<usize> {
+        let entries: Vec<_> = self
+            .packs
+            .read()
+            .expect("scan pack index lock poisoned")
+            .iter()
+            .map(|(start, path)| (*start, path.clone()))
+            .collect();
+        let mut retained: Vec<(u64, u64, PathBuf)> = Vec::new();
+        let mut stale = Vec::new();
+
+        'entries: for (start, path) in entries {
+            let pack = read_pack(&path)?;
+            loop {
+                let Some((_, retained_end, _)) = retained.last() else {
+                    retained.push((start, pack.end_height, path));
+                    continue 'entries;
+                };
+                if start >= *retained_end {
+                    retained.push((start, pack.end_height, path));
+                    continue 'entries;
+                }
+                if pack.end_height >= *retained_end {
+                    let (_, _, stale_path) = retained.pop().expect("checked above");
+                    stale.push(stale_path);
+                    continue;
+                }
+                stale.push(path);
+                continue 'entries;
+            }
+        }
+
+        for path in &stale {
+            fs::remove_file(path)?;
+        }
+        if !stale.is_empty() {
+            self.refresh()?;
+        }
+        Ok(stale.len())
+    }
+
     /// Delete immutable packs that start before the retained window.
     pub fn remove_before(&self, height: u64) -> Result<usize> {
         let stale: Vec<_> = self.packs.read().expect("scan pack index lock poisoned")
@@ -273,5 +322,19 @@ mod tests {
         assert_eq!(store.builder_block_count(101, 200, 1_000), 1);
         assert!(store.write(&pack(101, 1)).is_err());
         assert!(store.write(&pack(104, 1)).is_ok());
+    }
+
+    #[test]
+    fn removes_overlapping_packs_left_by_an_older_builder() {
+        let directory = tempfile::tempdir().unwrap();
+        let older = directory.path().join("pack-00000000000000000100.mwsp");
+        let newer = directory.path().join("pack-00000000000000000101.mwsp");
+        write_pack(&older, &pack(100, 2)).unwrap();
+        write_pack(&newer, &pack(101, 2)).unwrap();
+
+        let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
+        assert_eq!(store.cache_start_height(), Some(101));
+        assert!(!older.exists());
+        assert!(newer.exists());
     }
 }
