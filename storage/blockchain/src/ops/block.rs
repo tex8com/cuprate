@@ -333,7 +333,12 @@ pub fn get_wallet_scan_range(
         .collect::<DbResult<Vec<_>>>()?;
 
     if block_infos.len() != block_headers.len() || block_infos.len() != block_tx_hashes.len() {
-        return Err(RuntimeError::KeyNotFound);
+        return Err(RuntimeError::Io(std::io::Error::other(format!(
+            "wallet scan range metadata mismatch: start={start_height} end={end_height} infos={} headers={} tx_hash_lists={}",
+            block_infos.len(),
+            block_headers.len(),
+            block_tx_hashes.len(),
+        ))));
     }
 
     let Some(first_info) = block_infos.first() else {
@@ -370,7 +375,11 @@ pub fn get_wallet_scan_range(
     let expected_tx_count = usize::try_from(end_tx_id.saturating_sub(first_tx_id))
         .expect("transaction IDs fit in usize");
     if tx_blobs.len() != expected_tx_count || tx_outputs.len() != expected_tx_count {
-        return Err(RuntimeError::KeyNotFound);
+        return Err(RuntimeError::Io(std::io::Error::other(format!(
+            "wallet scan range transaction interval mismatch: heights={start_height}..{end_height} tx_ids={first_tx_id}..{end_tx_id} expected={expected_tx_count} blobs={} outputs={}",
+            tx_blobs.len(),
+            tx_outputs.len(),
+        ))));
     }
 
     let mut blocks = Vec::with_capacity(block_infos.len());
@@ -387,7 +396,10 @@ pub fn get_wallet_scan_range(
             // `add_block` writes the miner followed by all ordinary
             // transactions. A broken interval must use the safe legacy path,
             // never return mis-associated output indices.
-            return Err(RuntimeError::KeyNotFound);
+            return Err(RuntimeError::Io(std::io::Error::other(format!(
+                "wallet scan range discontinuity: heights={start_height}..{end_height} expected_tx_id={expected_tx_id} actual_miner_tx_id={}",
+                block_info.mining_tx_index,
+            ))));
         }
 
         let tx_count = tx_hashes.0.len().saturating_add(1);
