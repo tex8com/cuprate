@@ -96,6 +96,19 @@ impl ScanPackStore {
         Ok(pack.slice_from(height, max_blocks))
     }
 
+    /// Return the end of the physical pack that covers `height`.
+    ///
+    /// The cache builder must advance over the whole immutable file, not merely
+    /// over a client-sized slice. Otherwise a moving cache window leaves tiny
+    /// duplicate tail packs whenever the chain tip advances between passes.
+    pub fn covering_end(&self, height: u64) -> Result<Option<u64>> {
+        let path = self.packs.read().expect("scan pack index lock poisoned")
+            .range((Bound::Unbounded, Bound::Included(height))).next_back().map(|(_, path)| path.clone());
+        let Some(path) = path else { return Ok(None); };
+        let pack = read_pack(&path)?;
+        Ok((pack.start_height <= height && height < pack.end_height).then_some(pack.end_height))
+    }
+
     pub fn write(&self, pack: &ScanPack) -> Result<()> {
         let final_path = self.directory.join(format!("pack-{:020}.mwsp", pack.start_height));
         let temporary_path = self.directory.join(format!(".pack-{:020}.tmp", pack.start_height));
@@ -179,6 +192,6 @@ mod tests {
     fn persists_and_slices_pack() {
         let directory = tempfile::tempdir().unwrap(); let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
         let pack = ScanPack::new(100, vec![BlockCompleteEntry::default(), BlockCompleteEntry::default()], vec![BlockOutputIndices { indices: vec![] }, BlockOutputIndices { indices: vec![] }]).unwrap();
-        store.write(&pack).unwrap(); let read = store.load_covering(101, 10).unwrap().unwrap(); assert_eq!(read.start_height, 101); assert_eq!(read.end_height, 102); assert_eq!(read.blocks.len(), 1);
+        store.write(&pack).unwrap(); let read = store.load_covering(101, 10).unwrap().unwrap(); assert_eq!(read.start_height, 101); assert_eq!(read.end_height, 102); assert_eq!(read.blocks.len(), 1); assert_eq!(store.covering_end(101).unwrap(), Some(102));
     }
 }

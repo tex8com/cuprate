@@ -247,8 +247,8 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
             let mut height = start;
             let mut built = 0_u64;
             while height < end {
-                if let Ok(Some(existing)) = store.load_covering(height, chunk_blocks) {
-                    height = existing.end_height;
+                if let Ok(Some(existing_end)) = store.covering_end(height) {
+                    height = existing_end;
                     continue;
                 }
                 let count = usize::try_from(end.saturating_sub(height)).unwrap_or(usize::MAX).min(chunk_blocks);
