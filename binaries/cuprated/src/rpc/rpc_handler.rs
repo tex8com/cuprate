@@ -1,6 +1,6 @@
 //! `cuprated`'s implementation of [`RpcHandler`].
 
-use std::task::{Context, Poll};
+use std::{sync::Arc, task::{Context, Poll}};
 
 use anyhow::Error;
 use futures::future::BoxFuture;
@@ -19,7 +19,7 @@ use cuprate_rpc_types::{
 use cuprate_txpool::service::TxpoolReadHandle;
 use cuprate_types::BlockTemplate;
 
-use crate::{rpc::handlers, txpool::IncomingTxHandler};
+use crate::{rpc::{handlers, scanpack::ScanPackStore}, txpool::IncomingTxHandler};
 
 /// TODO: use real type when public.
 #[derive(Clone)]
@@ -171,16 +171,20 @@ pub struct CupratedRpcHandler {
     pub txpool_read: TxpoolReadHandle,
 
     pub tx_handler: IncomingTxHandler,
+
+    /// Optional immutable, disk-backed wallet scan packs.
+    pub wallet_scan_packs: Option<Arc<ScanPackStore>>,
 }
 
 impl CupratedRpcHandler {
     /// Create a new [`Self`].
-    pub const fn new(
+    pub fn new(
         restricted: bool,
         blockchain_read: BlockchainReadHandle,
         blockchain_context: BlockchainContextService,
         txpool_read: TxpoolReadHandle,
         tx_handler: IncomingTxHandler,
+        wallet_scan_packs: Option<Arc<ScanPackStore>>,
     ) -> Self {
         Self {
             restricted,
@@ -188,6 +192,7 @@ impl CupratedRpcHandler {
             blockchain_context,
             txpool_read,
             tx_handler,
+            wallet_scan_packs,
         }
     }
 }

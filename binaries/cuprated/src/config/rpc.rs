@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -29,6 +30,47 @@ config_struct! {
         /// RPC. Compatible wallets can opt in for ~1.6-1.8x more throughput;
         /// standard wallets keep using bin RPC unchanged.
         pub grpc: GrpcConfig,
+
+        #[child = true]
+        /// Optional persistent, block-oriented wallet scan cache.
+        pub wallet_scan_cache: WalletScanCacheConfig,
+    }
+}
+
+config_struct! {
+    /// Optional sidecar for prepared wallet-scan blocks.
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct WalletScanCacheConfig {
+        /// Enable serving prepared scan packs when available.
+        pub enable: bool,
+        /// Directory outside the canonical blockchain database.
+        pub directory: PathBuf,
+        /// First cached block height, inclusive.
+        pub start_height: u64,
+        /// Maximum retained cached blocks. `-1` retains all blocks from
+        /// `start_height`; a positive value creates a moving recent window.
+        pub max_blocks: i64,
+        /// Maximum blocks per immutable scan pack.
+        pub chunk_blocks: usize,
+        /// Build missing packs in the background after startup.
+        pub build_on_start: bool,
+        /// Seconds between checks for new blocks after the initial build.
+        pub build_poll_seconds: u64,
+    }
+}
+
+impl Default for WalletScanCacheConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            directory: PathBuf::from("wallet-scan-cache"),
+            start_height: 0,
+            max_blocks: -1,
+            chunk_blocks: 1_000,
+            build_on_start: true,
+            build_poll_seconds: 30,
+        }
     }
 }
 

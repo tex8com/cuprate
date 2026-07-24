@@ -35,6 +35,7 @@ use crate::rpc::{
     handlers::{bin as bin_handlers, helper as bin_helper},
     CupratedRpcHandler,
 };
+use crate::config::WalletScanCacheConfig;
 
 #[allow(
     clippy::unnecessary_qualifications,
@@ -129,6 +130,7 @@ struct FetchedChunk {
     prepared_output_indices: Option<Vec<BlockOutputIndices>>,
     prepared_index_metrics: Option<bin_handlers::OutputIndicesMetrics>,
     range_read: bool,
+    scanpack_hit: bool,
 }
 
 struct IndexedChunk {
@@ -218,6 +220,56 @@ impl BlockStream for BlockStreamService {
     }
 }
 
+/// Build missing scan packs without blocking RPC serving. Existing packs are
+/// immutable; a positive `max_blocks` turns the directory into a moving window.
+pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanCacheConfig) {
+    let Some(store) = state.wallet_scan_packs.clone() else { return; };
+    if !config.build_on_start { return; }
+    let chunk_blocks = config.chunk_blocks.clamp(MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS);
+    tokio::spawn(async move {
+        loop {
+            let Ok((top_height, _)) = bin_helper::top_height(&mut state).await else {
+                eprintln!("[SCANPACK] unable to obtain chain tip; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(config.build_poll_seconds.max(1))).await;
+                continue;
+            };
+            let end = top_height.saturating_add(1);
+            let start = if config.max_blocks < 0 {
+                config.start_height.min(end)
+            } else {
+                end.saturating_sub(config.max_blocks as u64).max(config.start_height)
+            };
+            match store.remove_before(start) {
+                Ok(removed) if removed > 0 => eprintln!("[SCANPACK] evicted {removed} packs below height {start}"),
+                Ok(_) => (),
+                Err(error) => eprintln!("[SCANPACK] eviction error: {error:#}"),
+            }
+            let mut height = start;
+            let mut built = 0_u64;
+            while height < end {
+                if let Ok(Some(existing)) = store.load_covering(height, chunk_blocks) {
+                    height = existing.end_height;
+                    continue;
+                }
+                let count = usize::try_from(end.saturating_sub(height)).unwrap_or(usize::MAX).min(chunk_blocks);
+                match bin_handlers::capped_wallet_scan_range_with_metrics(
+                    &mut state, usize::try_from(height).unwrap(), usize::try_from(end).unwrap(), count,
+                    true, false, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT,
+                ).await {
+                    Ok((blocks, output_indices, _, _, _)) => match crate::rpc::scanpack::ScanPack::new(height, blocks, output_indices).and_then(|pack| store.write(&pack)) {
+                        Ok(()) => { built += 1; height = height.saturating_add(u64::try_from(count).unwrap()); if built % 16 == 0 { eprintln!("[SCANPACK] built {built} packs; next_height={height} tip={end}"); } }
+                        Err(error) => { eprintln!("[SCANPACK] write error at height {height}: {error:#}"); break; }
+                    },
+                    Err(error) => { eprintln!("[SCANPACK] build error at height {height}: {error:#}"); break; }
+                }
+                tokio::task::yield_now().await;
+            }
+            if built > 0 { eprintln!("[SCANPACK] pass complete: built={built} covered_until={height} tip={end}"); }
+            tokio::time::sleep(std::time::Duration::from_secs(config.build_poll_seconds.max(1))).await;
+        }
+    });
+}
+
 async fn fetch_chunk(
     mut state: CupratedRpcHandler,
     start: usize,
@@ -240,8 +292,38 @@ async fn fetch_chunk(
         return Ok(None);
     }
 
-    let want = chunk_blocks.min(target_end - start);
+    let mut want = chunk_blocks.min(target_end - start);
+    // Do not let a legacy response cross into the first cached height. The
+    // following request will start exactly at the ScanPack boundary.
+    if let Some(cache_start) = state
+        .wallet_scan_packs
+        .as_ref()
+        .and_then(|store| store.cache_start_height())
+    {
+        if u64::try_from(start)? < cache_start
+            && cache_start < u64::try_from(start.saturating_add(want))?
+        {
+            want = usize::try_from(cache_start)?.saturating_sub(start);
+        }
+    }
     let t_fetch = Instant::now();
+    if let Some(store) = &state.wallet_scan_packs {
+        if let Some(pack) = store.load_covering(u64::try_from(start)?, want)? {
+            let block_count = pack.blocks.len();
+            let tx_count = pack.blocks.iter().map(|block| block.txs.len()).sum();
+            let index_values = pack.output_indices.iter().flat_map(|block| &block.indices)
+                .map(|tx| tx.indices.len()).sum();
+            return Ok(Some(FetchedChunk {
+                top_h, chain_height, target_end, start, blocks: pack.blocks, top_ms,
+                fetch_ms: t_fetch.elapsed().as_secs_f64() * 1000.0,
+                fetch_metrics: bin_handlers::BlockFetchMetrics { returned_blocks: block_count, returned_txs: tx_count, ..Default::default() },
+                prepared_output_indices: Some(pack.output_indices),
+                prepared_index_metrics: Some(bin_handlers::OutputIndicesMetrics { blocks: block_count, transactions: tx_count, output_index_values: index_values, ..Default::default() }),
+                range_read: false,
+                scanpack_hit: true,
+            }));
+        }
+    }
     let range_requested = sync_range_reads_enabled();
     let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics, range_read) =
         if range_requested {
@@ -290,6 +372,7 @@ async fn fetch_chunk(
         prepared_output_indices,
         prepared_index_metrics,
         range_read,
+        scanpack_hit: false,
     }))
 }
 
@@ -411,6 +494,7 @@ async fn produce_block_stream(
             fetch_ms,
             fetch_metrics,
             range_read,
+            scanpack_hit,
             ..
         } = indexed.fetched;
         let output_indices = indexed.output_indices;
@@ -489,9 +573,9 @@ async fn produce_block_stream(
         };
 
         eprintln!(
-            "[SYNC_TRACE_SERVER] id={} seq={} start={} n_blocks={} payload_bytes={} range_read={} pipeline_depth={} top_ms={:.3} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} fetch_limit_bytes={} fetch_limit_txs={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={} response_build_ms={:.3} epee_encode_ms={:.3} protobuf_copy_ms={:.3} queue_depth_before={} queue_depth_after={} queue_send_wait_ms={:.3} upstream_ms={:.3} bp_ratio={:.3} cum_ms={:.3} cum_bytes={} cum_mbs={:.3} chain_tip={}",
+            "[SYNC_TRACE_SERVER] id={} seq={} start={} n_blocks={} payload_bytes={} range_read={} scanpack_hit={} pipeline_depth={} top_ms={:.3} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} fetch_limit_bytes={} fetch_limit_txs={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={} response_build_ms={:.3} epee_encode_ms={:.3} protobuf_copy_ms={:.3} queue_depth_before={} queue_depth_after={} queue_send_wait_ms={:.3} upstream_ms={:.3} bp_ratio={:.3} cum_ms={:.3} cum_bytes={} cum_mbs={:.3} chain_tip={}",
             server_req_id, chunk_seq, response_start, actual_blocks, payload_len,
-            range_read, pipeline_depth,
+            range_read, scanpack_hit, pipeline_depth,
             top_ms, fetch_ms, fetch_metrics.batch_count, fetch_metrics.height_vector_ms,
             fetch_metrics.database_ms, fetch_metrics.cap_and_collect_ms,
             fetch_metrics.returned_txs, fetch_metrics.estimated_response_bytes,

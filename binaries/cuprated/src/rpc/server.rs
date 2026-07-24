@@ -20,7 +20,7 @@ use cuprate_txpool::service::TxpoolReadHandle;
 
 use crate::{
     config::{grpc_rpc_port, restricted_rpc_port, unrestricted_rpc_port, GrpcConfig, RpcConfig},
-    rpc::{grpc, rpc_handler::BlockchainManagerHandle, CupratedRpcHandler},
+    rpc::{grpc, rpc_handler::BlockchainManagerHandle, scanpack::ScanPackStore, CupratedRpcHandler},
     txpool::IncomingTxHandler,
 };
 
@@ -39,6 +39,12 @@ pub fn init_rpc_servers(
     txpool_read: TxpoolReadHandle,
     tx_handler: IncomingTxHandler,
 ) {
+    let wallet_scan_packs = if config.wallet_scan_cache.enable {
+        Some(ScanPackStore::open(config.wallet_scan_cache.directory.clone())
+            .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")))
+    } else {
+        None
+    };
     for ((enable, addr, port, request_byte_limit), restricted) in [
         (
             (
@@ -84,6 +90,7 @@ pub fn init_rpc_servers(
             blockchain_context.clone(),
             txpool_read.clone(),
             tx_handler.clone(),
+            wallet_scan_packs.clone(),
         );
 
         tokio::task::spawn(async move {
@@ -106,7 +113,9 @@ pub fn init_rpc_servers(
             blockchain_context.clone(),
             txpool_read.clone(),
             tx_handler.clone(),
+            wallet_scan_packs.clone(),
         );
+        grpc::spawn_scanpack_builder(grpc_handler.clone(), config.wallet_scan_cache.clone());
         let grpc_addr = config.grpc.address;
         let grpc_port = grpc_rpc_port(config.grpc.port, network);
         let allow_public = config.grpc.i_know_what_im_doing_allow_public_grpc;
