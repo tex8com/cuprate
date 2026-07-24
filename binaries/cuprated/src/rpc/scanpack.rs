@@ -66,7 +66,12 @@ pub struct ScanPackStore {
 }
 
 impl ScanPackStore {
-    pub fn open(directory: PathBuf, configured_start_height: u64, max_blocks: i64) -> Result<Arc<Self>> {
+    pub fn open(
+        directory: PathBuf,
+        configured_start_height: u64,
+        max_blocks: i64,
+        chunk_blocks: usize,
+    ) -> Result<Arc<Self>> {
         fs::create_dir_all(&directory)
             .with_context(|| format!("creating scan pack directory {}", directory.display()))?;
         let store = Arc::new(Self {
@@ -79,6 +84,10 @@ impl ScanPackStore {
         let removed = store.remove_overlaps()?;
         if removed > 0 {
             eprintln!("[SCANPACK] removed {removed} overlapping cache packs during startup");
+        }
+        let removed = store.remove_short_tail_packs(chunk_blocks)?;
+        if removed > 0 {
+            eprintln!("[SCANPACK] removed {removed} fragmented tail packs during startup");
         }
         Ok(store)
     }
@@ -276,6 +285,40 @@ impl ScanPackStore {
         Ok(stale.len())
     }
 
+    /// Discard an old-builder suffix of incomplete packs. It is safe to miss
+    /// the newest short range temporarily: requests fall back to the DB until
+    /// a full immutable package can be written. Keeping the suffix would make
+    /// the package count grow by one file per newly mined block.
+    fn remove_short_tail_packs(&self, chunk_blocks: usize) -> Result<usize> {
+        let entries: Vec<_> = self
+            .packs
+            .read()
+            .expect("scan pack index lock poisoned")
+            .iter()
+            .map(|(start, path)| (*start, path.clone()))
+            .collect();
+        let mut stale = Vec::new();
+        let mut found_full_pack = false;
+        for (_, path) in entries.iter().rev() {
+            let pack = read_pack(path)?;
+            if pack.blocks.len() >= chunk_blocks {
+                found_full_pack = true;
+                break;
+            }
+            stale.push(path.clone());
+        }
+        if !found_full_pack {
+            return Ok(0);
+        }
+        for path in &stale {
+            fs::remove_file(path)?;
+        }
+        if !stale.is_empty() {
+            self.refresh()?;
+        }
+        Ok(stale.len())
+    }
+
     /// Delete immutable packs that have expired completely before the logical
     /// window. A package straddling the lower bound is kept physically and is
     /// sliced at request time.
@@ -350,7 +393,7 @@ mod tests {
     use super::*;
 
     fn store(directory: PathBuf) -> Arc<ScanPackStore> {
-        ScanPackStore::open(directory, 0, -1).unwrap()
+        ScanPackStore::open(directory, 0, -1, 1_000).unwrap()
     }
 
     fn pack(start_height: u64, count: usize) -> ScanPack {
@@ -399,7 +442,7 @@ mod tests {
     #[test]
     fn rolling_window_keeps_boundary_pack_but_hides_its_prefix() {
         let directory = tempfile::tempdir().unwrap();
-        let store = ScanPackStore::open(directory.path().to_path_buf(), 0, 100).unwrap();
+        let store = ScanPackStore::open(directory.path().to_path_buf(), 0, 100, 1_000).unwrap();
         store.write(&pack(100, 2)).unwrap();
         store.write(&pack(102, 2)).unwrap();
 
@@ -418,5 +461,22 @@ mod tests {
         assert!(!empty.should_defer_short_tail(100, 101, 1, 1_000));
         empty.write(&pack(100, 2)).unwrap();
         assert!(empty.should_defer_short_tail(102, 103, 1, 1_000));
+    }
+
+    #[test]
+    fn removes_fragmented_tail_left_by_an_older_builder() {
+        let directory = tempfile::tempdir().unwrap();
+        let full = directory.path().join("pack-00000000000000000100.mwsp");
+        let tail_one = directory.path().join("pack-00000000000000000102.mwsp");
+        let tail_two = directory.path().join("pack-00000000000000000103.mwsp");
+        write_pack(&full, &pack(100, 2)).unwrap();
+        write_pack(&tail_one, &pack(102, 1)).unwrap();
+        write_pack(&tail_two, &pack(103, 1)).unwrap();
+
+        let store = ScanPackStore::open(directory.path().to_path_buf(), 0, -1, 2).unwrap();
+        assert_eq!(store.cache_start_height(), Some(100));
+        assert!(full.exists());
+        assert!(!tail_one.exists());
+        assert!(!tail_two.exists());
     }
 }

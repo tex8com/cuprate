@@ -44,6 +44,7 @@ pub fn init_rpc_servers(
             config.wallet_scan_cache.directory.clone(),
             config.wallet_scan_cache.start_height,
             config.wallet_scan_cache.max_blocks,
+            config.wallet_scan_cache.chunk_blocks,
         )
             .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")))
     } else {
