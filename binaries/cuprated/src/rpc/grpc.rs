@@ -234,11 +234,7 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                 continue;
             };
             let end = top_height.saturating_add(1);
-            let start = if config.max_blocks < 0 {
-                config.start_height.min(end)
-            } else {
-                end.saturating_sub(config.max_blocks as u64).max(config.start_height)
-            };
+            let start = store.logical_start_height(end);
             match store.remove_before(start) {
                 Ok(removed) if removed > 0 => eprintln!("[SCANPACK] evicted {removed} packs below height {start}"),
                 Ok(_) => (),
@@ -252,6 +248,9 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                     continue;
                 }
                 let count = store.builder_block_count(height, end, chunk_blocks);
+                if store.should_defer_short_tail(height, end, count, chunk_blocks) {
+                    break;
+                }
                 match bin_handlers::capped_wallet_scan_range_with_metrics(
                     &mut state, usize::try_from(height).unwrap(), usize::try_from(end).unwrap(), count,
                     true, false, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT,
@@ -297,13 +296,13 @@ async fn fetch_chunk(
     }
 
     let mut want = chunk_blocks.min(target_end - start);
+    let cache_start = match &state.wallet_scan_packs {
+        Some(store) => store.first_available_height(store.logical_start_height(u64::try_from(target_end)?))?,
+        None => None,
+    };
     // Do not let a legacy response cross into the first cached height. The
     // following request will start exactly at the ScanPack boundary.
-    if let Some(cache_start) = state
-        .wallet_scan_packs
-        .as_ref()
-        .and_then(|store| store.cache_start_height())
-    {
+    if let Some(cache_start) = cache_start {
         if u64::try_from(start)? < cache_start
             && cache_start < u64::try_from(start.saturating_add(want))?
         {
@@ -311,8 +310,9 @@ async fn fetch_chunk(
         }
     }
     let t_fetch = Instant::now();
-    if let Some(store) = &state.wallet_scan_packs {
-        if let Some(pack) = store.load_covering(u64::try_from(start)?, want)? {
+    if let (Some(store), Some(cache_start)) = (&state.wallet_scan_packs, cache_start) {
+        if u64::try_from(start)? >= cache_start {
+            if let Some(pack) = store.load_covering(u64::try_from(start)?, want)? {
             let block_count = pack.blocks.len();
             let tx_count = pack.blocks.iter().map(|block| block.txs.len()).sum();
             let index_values = pack.output_indices.iter().flat_map(|block| &block.indices)
@@ -326,6 +326,7 @@ async fn fetch_chunk(
                 range_read: false,
                 scanpack_hit: true,
             }));
+            }
         }
     }
     let range_requested = sync_range_reads_enabled();

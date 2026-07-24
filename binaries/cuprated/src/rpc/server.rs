@@ -40,7 +40,11 @@ pub fn init_rpc_servers(
     tx_handler: IncomingTxHandler,
 ) {
     let wallet_scan_packs = if config.wallet_scan_cache.enable {
-        Some(ScanPackStore::open(config.wallet_scan_cache.directory.clone())
+        Some(ScanPackStore::open(
+            config.wallet_scan_cache.directory.clone(),
+            config.wallet_scan_cache.start_height,
+            config.wallet_scan_cache.max_blocks,
+        )
             .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")))
     } else {
         None

@@ -60,14 +60,21 @@ impl ScanPack {
 #[derive(Debug)]
 pub struct ScanPackStore {
     directory: PathBuf,
+    configured_start_height: u64,
+    max_blocks: i64,
     packs: RwLock<BTreeMap<u64, PathBuf>>,
 }
 
 impl ScanPackStore {
-    pub fn open(directory: PathBuf) -> Result<Arc<Self>> {
+    pub fn open(directory: PathBuf, configured_start_height: u64, max_blocks: i64) -> Result<Arc<Self>> {
         fs::create_dir_all(&directory)
             .with_context(|| format!("creating scan pack directory {}", directory.display()))?;
-        let store = Arc::new(Self { directory, packs: RwLock::new(BTreeMap::new()) });
+        let store = Arc::new(Self {
+            directory,
+            configured_start_height,
+            max_blocks,
+            packs: RwLock::new(BTreeMap::new()),
+        });
         store.refresh()?;
         let removed = store.remove_overlaps()?;
         if removed > 0 {
@@ -92,6 +99,41 @@ impl ScanPackStore {
         self.packs.read().expect("scan pack index lock poisoned").first_key_value().map(|(height, _)| *height)
     }
 
+    /// The first height that may be served from a bounded rolling cache for a
+    /// chain ending at `end`. Physical packs may start earlier so that an
+    /// immutable package is retained until it has expired completely.
+    pub fn logical_start_height(&self, end: u64) -> u64 {
+        if self.max_blocks < 0 {
+            self.configured_start_height.min(end)
+        } else {
+            end.saturating_sub(self.max_blocks as u64).max(self.configured_start_height)
+        }
+    }
+
+    /// The first cached height that is eligible for a request whose logical
+    /// lower bound is `minimum_height`.
+    pub fn first_available_height(&self, minimum_height: u64) -> Result<Option<u64>> {
+        let (previous, next_start) = {
+            let packs = self.packs.read().expect("scan pack index lock poisoned");
+            let previous = packs
+                .range((Bound::Unbounded, Bound::Included(minimum_height)))
+                .next_back()
+                .map(|(_, path)| path.clone());
+            let next_start = packs
+                .range((Bound::Excluded(minimum_height), Bound::Unbounded))
+                .next()
+                .map(|(start, _)| *start);
+            (previous, next_start)
+        };
+        if let Some(path) = previous {
+            let pack = read_pack(&path)?;
+            if pack.end_height > minimum_height {
+                return Ok(Some(minimum_height));
+            }
+        }
+        Ok(next_start)
+    }
+
     /// Return the first physical pack boundary strictly after `height`.
     ///
     /// The moving-window builder uses this to make a shortened leading pack
@@ -113,6 +155,16 @@ impl ScanPackStore {
             count = count.min(gap);
         }
         count
+    }
+
+    /// Once a cache has at least one package, defer an incomplete newest tail
+    /// until it forms a full package. This keeps immutable rolling caches from
+    /// creating one tiny file for every newly mined block; the newest short
+    /// tail safely uses the ordinary DB fallback in the meantime.
+    pub fn should_defer_short_tail(&self, height: u64, end: u64, count: usize, chunk_blocks: usize) -> bool {
+        count < chunk_blocks
+            && height.saturating_add(u64::try_from(count).unwrap_or(u64::MAX)) == end
+            && !self.packs.read().expect("scan pack index lock poisoned").is_empty()
     }
 
     pub fn load_covering(&self, height: u64, max_blocks: usize) -> Result<Option<ScanPack>> {
@@ -224,14 +276,16 @@ impl ScanPackStore {
         Ok(stale.len())
     }
 
-    /// Delete immutable packs that start before the retained window.
+    /// Delete immutable packs that have expired completely before the logical
+    /// window. A package straddling the lower bound is kept physically and is
+    /// sliced at request time.
     pub fn remove_before(&self, height: u64) -> Result<usize> {
         let stale: Vec<_> = self.packs.read().expect("scan pack index lock poisoned")
             .iter().filter_map(|(start, path)| (*start < height).then(|| (*start, path.clone()))).collect();
         let mut removed = 0;
         for (start, path) in stale {
             let pack = read_pack(&path)?;
-            if pack.start_height < height {
+            if pack.end_height <= height {
                 fs::remove_file(&path)?;
                 self.packs.write().expect("scan pack index lock poisoned").remove(&start);
                 removed += 1;
@@ -295,6 +349,10 @@ fn read_pack(path: &Path) -> Result<ScanPack> {
 mod tests {
     use super::*;
 
+    fn store(directory: PathBuf) -> Arc<ScanPackStore> {
+        ScanPackStore::open(directory, 0, -1).unwrap()
+    }
+
     fn pack(start_height: u64, count: usize) -> ScanPack {
         ScanPack::new(
             start_height,
@@ -305,7 +363,7 @@ mod tests {
 
     #[test]
     fn persists_and_slices_pack() {
-        let directory = tempfile::tempdir().unwrap(); let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
+        let directory = tempfile::tempdir().unwrap(); let store = store(directory.path().to_path_buf());
         let pack = pack(100, 2);
         store.write(&pack).unwrap(); let read = store.load_covering(101, 10).unwrap().unwrap(); assert_eq!(read.start_height, 101); assert_eq!(read.end_height, 102); assert_eq!(read.blocks.len(), 1); assert_eq!(store.covering_end(101).unwrap(), Some(102));
     }
@@ -313,7 +371,7 @@ mod tests {
     #[test]
     fn preserves_physical_pack_boundaries() {
         let directory = tempfile::tempdir().unwrap();
-        let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
+        let store = store(directory.path().to_path_buf());
         store.write(&pack(100, 2)).unwrap();
         store.write(&pack(102, 2)).unwrap();
 
@@ -332,9 +390,33 @@ mod tests {
         write_pack(&older, &pack(100, 2)).unwrap();
         write_pack(&newer, &pack(101, 2)).unwrap();
 
-        let store = ScanPackStore::open(directory.path().to_path_buf()).unwrap();
+        let store = store(directory.path().to_path_buf());
         assert_eq!(store.cache_start_height(), Some(101));
         assert!(!older.exists());
         assert!(newer.exists());
+    }
+
+    #[test]
+    fn rolling_window_keeps_boundary_pack_but_hides_its_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ScanPackStore::open(directory.path().to_path_buf(), 0, 100).unwrap();
+        store.write(&pack(100, 2)).unwrap();
+        store.write(&pack(102, 2)).unwrap();
+
+        assert_eq!(store.logical_start_height(201), 101);
+        assert_eq!(store.first_available_height(101).unwrap(), Some(101));
+        assert_eq!(store.remove_before(101).unwrap(), 0);
+        assert_eq!(store.cache_start_height(), Some(100));
+        assert_eq!(store.remove_before(102).unwrap(), 1);
+        assert_eq!(store.first_available_height(102).unwrap(), Some(102));
+    }
+
+    #[test]
+    fn rolling_window_defers_a_short_newest_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = store(directory.path().to_path_buf());
+        assert!(!empty.should_defer_short_tail(100, 101, 1, 1_000));
+        empty.write(&pack(100, 2)).unwrap();
+        assert!(empty.should_defer_short_tail(102, 103, 1, 1_000));
     }
 }
