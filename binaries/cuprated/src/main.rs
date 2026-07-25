@@ -33,8 +33,11 @@ use cuprate_types::blockchain::BlockchainWriteRequest;
 use txpool::IncomingTxHandler;
 
 use crate::{
-    blockchain::SyncNotify, config::Config, constants::PANIC_CRITICAL_SERVICE_ERROR,
-    logging::CupratedTracingFilter, tor::initialize_tor_if_enabled,
+    blockchain::SyncNotify,
+    config::Config,
+    constants::{PANIC_CRITICAL_SERVICE_ERROR, PRODUCT_NAME},
+    logging::CupratedTracingFilter,
+    tor::initialize_tor_if_enabled,
 };
 
 mod blockchain;
@@ -63,6 +66,11 @@ fn main() {
 
     // Initialize logging.
     logging::init_logging(&config);
+
+    info!(
+        product = PRODUCT_NAME,
+        "Starting TEX8 Fast Wallet production node"
+    );
 
     //Printing configuration
     info!("{config}");

@@ -8,11 +8,13 @@ use cuprate_constants::build::{BUILD, COMMIT};
 use cuprate_rpc_types::{CORE_RPC_VERSION, CORE_RPC_VERSION_MAJOR, CORE_RPC_VERSION_MINOR};
 use cuprate_types::HardFork;
 
-use crate::constants::{MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION, VERSION};
+use crate::constants::{MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION, PRODUCT_NAME, VERSION};
 
 // NOTE: keep `books/user/src/cli.md` updated with this struct.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CupratedVersionInfo {
+    /// Stable product identity of this TEX8 production build.
+    product_name: &'static str,
     /// `cuprated`'s major version.
     major_version: u8,
     /// `cuprated`'s minor version.
@@ -41,6 +43,7 @@ impl CupratedVersionInfo {
     /// Generate version info.
     pub fn new() -> Self {
         Self {
+            product_name: PRODUCT_NAME,
             major_version: MAJOR_VERSION.parse().unwrap(),
             minor_version: MINOR_VERSION.parse().unwrap(),
             patch_version: PATCH_VERSION.parse().unwrap(),
@@ -63,6 +66,7 @@ mod tests {
     /// Tests that [`CupratedVersionInfo`] can be generated.
     #[test]
     fn new() {
-        CupratedVersionInfo::new();
+        let version = CupratedVersionInfo::new();
+        assert_eq!(version.product_name, "tex8-fastwallet-cuprate");
     }
 }

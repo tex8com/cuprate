@@ -3,6 +3,12 @@ use std::time::Duration;
 
 use const_format::formatcp;
 
+/// Stable product identity for the TEX8 Fast Wallet production node.
+///
+/// This is intentionally not injected into Monero's P2P handshake because the
+/// wire protocol has no free-form node-name field.
+pub const PRODUCT_NAME: &str = "tex8-fastwallet-cuprate";
+
 /// `cuprated`'s semantic version (`MAJOR.MINOR.PATCH`) as string.
 pub const VERSION: &str = clap::crate_version!();
 
@@ -42,6 +48,7 @@ mod test {
     #[test]
     fn version() {
         let semantic_version = format!("{MAJOR_VERSION}.{MINOR_VERSION}.{PATCH_VERSION}");
+        assert_eq!(PRODUCT_NAME, "tex8-fastwallet-cuprate");
         assert_eq!(VERSION, VERSION);
         assert_eq!(VERSION, "0.0.8");
     }

@@ -5,8 +5,12 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+
 use anyhow::Error;
 use tokio::net::TcpListener;
+use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tower::limit::rate::RateLimitLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -20,7 +24,9 @@ use cuprate_txpool::service::TxpoolReadHandle;
 
 use crate::{
     config::{grpc_rpc_port, restricted_rpc_port, unrestricted_rpc_port, GrpcConfig, RpcConfig},
-    rpc::{grpc, rpc_handler::BlockchainManagerHandle, scanpack::ScanPackStore, CupratedRpcHandler},
+    rpc::{
+        grpc, rpc_handler::BlockchainManagerHandle, scanpack::ScanPackStore, CupratedRpcHandler,
+    },
     txpool::IncomingTxHandler,
 };
 
@@ -40,13 +46,15 @@ pub fn init_rpc_servers(
     tx_handler: IncomingTxHandler,
 ) {
     let wallet_scan_packs = if config.wallet_scan_cache.enable {
-        Some(ScanPackStore::open(
-            config.wallet_scan_cache.directory.clone(),
-            config.wallet_scan_cache.start_height,
-            config.wallet_scan_cache.max_blocks,
-            config.wallet_scan_cache.chunk_blocks,
+        Some(
+            ScanPackStore::open(
+                config.wallet_scan_cache.directory.clone(),
+                config.wallet_scan_cache.start_height,
+                config.wallet_scan_cache.max_blocks,
+                config.wallet_scan_cache.chunk_blocks,
+            )
+            .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")),
         )
-            .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")))
     } else {
         None
     };
@@ -131,8 +139,9 @@ pub fn init_rpc_servers(
             warn!(address = %grpc_addr, "Starting gRPC server on non-local address");
         }
         let bind = SocketAddr::new(grpc_addr, grpc_port);
+        let tcp_congestion_control = config.grpc.tcp_congestion_control.clone();
         tokio::task::spawn(async move {
-            if let Err(e) = run_grpc_server(grpc_handler, bind).await {
+            if let Err(e) = run_grpc_server(grpc_handler, bind, tcp_congestion_control).await {
                 eprintln!("[GRPC] server task exited with error: {e:?}");
             }
         });
@@ -148,23 +157,87 @@ pub fn init_rpc_servers(
 async fn run_grpc_server(
     rpc_handler: CupratedRpcHandler,
     address: SocketAddr,
+    tcp_congestion_control: Option<String>,
 ) -> Result<(), Error> {
     use tonic::transport::Server;
 
     eprintln!("[GRPC] Starting BlockStream server at {address}");
-    info!(address = %address, "Starting gRPC streaming server");
+    info!(
+        address = %address,
+        tcp_congestion_control = ?tcp_congestion_control,
+        "Starting gRPC streaming server"
+    );
 
     let svc = grpc::block_stream_service(rpc_handler);
+    let listener = TcpListener::bind(address).await?;
+    let incoming = TcpListenerStream::new(listener).map(move |connection| {
+        let stream = connection?;
+        if let Some(algorithm) = tcp_congestion_control.as_deref() {
+            if let Err(error) = set_grpc_tcp_congestion_control(&stream, algorithm) {
+                // Keep wallet data service available if the host kernel does
+                // not expose the optional algorithm. The concrete socket
+                // error is logged for benchmark evidence; P2P and the system
+                // TCP default are never touched here.
+                warn!(%error, %algorithm, "Unable to set wallet-gRPC TCP congestion control; using kernel default for this socket");
+            }
+        }
+        Ok::<_, std::io::Error>(stream)
+    });
 
     Server::builder()
         .initial_stream_window_size(Some(grpc::GRPC_HTTP2_STREAM_WINDOW_BYTES))
         .initial_connection_window_size(Some(grpc::GRPC_HTTP2_CONNECTION_WINDOW_BYTES))
         .add_service(svc)
-        .serve(address)
+        .serve_with_incoming(incoming)
         .await
         .map_err(|e| anyhow::anyhow!("tonic server error: {e}"))?;
 
     Ok(())
+}
+
+/// Sets congestion control on exactly one accepted wallet-gRPC TCP socket.
+/// Linux owns the algorithm registry; no system-wide sysctl is changed.
+#[cfg(target_os = "linux")]
+fn set_grpc_tcp_congestion_control(
+    stream: &tokio::net::TcpStream,
+    algorithm: &str,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let algorithm = CString::new(algorithm).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gRPC TCP congestion control must not contain a NUL byte",
+        )
+    })?;
+    // SAFETY: the TCP stream owns a valid file descriptor for this entire
+    // call. `algorithm` remains allocated for the pointer and length passed
+    // to `setsockopt`, and TCP_CONGESTION expects a NUL-terminated name.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            algorithm.as_ptr().cast(),
+            algorithm.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_grpc_tcp_congestion_control(
+    _stream: &tokio::net::TcpStream,
+    _algorithm: &str,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "per-socket TCP congestion control is only implemented for Linux",
+    ))
 }
 
 /// This initializes and runs an RPC server.

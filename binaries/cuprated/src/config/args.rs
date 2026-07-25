@@ -9,7 +9,7 @@ use crate::{config::Config, version::CupratedVersionInfo};
 
 /// Cuprate Args.
 #[derive(clap::Parser, Debug)]
-#[command(about)]
+#[command(name = "tex8-fastwallet-cuprate", about)]
 pub struct Args {
     /// The network to run on.
     #[arg(

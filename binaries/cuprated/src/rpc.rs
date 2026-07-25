@@ -4,9 +4,9 @@
 
 mod constants;
 pub(crate) mod grpc;
-pub(crate) mod scanpack;
 mod handlers;
 mod rpc_handler;
+pub(crate) mod scanpack;
 mod server;
 mod service;
 
