@@ -130,6 +130,8 @@ async fn get_transactions(
     mut state: CupratedRpcHandler,
     request: GetTransactionsRequest,
 ) -> Result<GetTransactionsResponse, Error> {
+    reject_unsupported_transaction_json(request.decode_as_json)?;
+
     if state.is_restricted() && request.txs_hashes.len() > RESTRICTED_TRANSACTIONS_COUNT {
         return Err(anyhow!(
             "Too many transactions requested in restricted mode"
@@ -269,6 +271,20 @@ async fn get_transactions(
         missed_tx,
         txs,
     })
+}
+
+/// Cuprate's JSON conversion for non-coinbase RingCT transactions still
+/// contains upstream `todo!()` branches. Reject the optional JSON form before
+/// reading databases or converting an attacker-selected transaction so the
+/// public endpoint fails closed instead of aborting the daemon. Raw hex
+/// remains available through the same endpoint.
+fn reject_unsupported_transaction_json(decode_as_json: bool) -> Result<(), Error> {
+    if decode_as_json {
+        return Err(anyhow!(
+            "decode_as_json is temporarily unsupported; request raw transaction hex instead"
+        ));
+    }
+    Ok(())
 }
 
 /// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/rpc/core_rpc_server.cpp#L790-L815>
@@ -823,4 +839,18 @@ async fn set_log_hash_rate(
     request: SetLogHashRateRequest,
 ) -> Result<SetLogHashRateResponse, Error> {
     unreachable!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_unsupported_transaction_json;
+
+    #[test]
+    fn transaction_json_request_fails_closed_without_panicking() {
+        assert!(reject_unsupported_transaction_json(false).is_ok());
+        let error = reject_unsupported_transaction_json(true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("decode_as_json is temporarily unsupported"));
+    }
 }
