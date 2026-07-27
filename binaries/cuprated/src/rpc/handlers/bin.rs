@@ -35,6 +35,7 @@ use monero_oxide::block::Block;
 
 use crate::rpc::{
     handlers::{helper, shared, shared::not_available},
+    scanpack::ScanPack,
     service::{blockchain, txpool},
     CupratedRpcHandler,
 };
@@ -234,39 +235,40 @@ async fn get_blocks(
         .min(u64_to_usize(max_blocks));
 
     let t_blocks = Instant::now();
-    let (blocks, block_metrics) = capped_block_complete_entries_with_metrics(
-        &mut state,
-        response_start_height,
-        chain_height,
-        block_count,
-        prune,
-        GET_BLOCKS_BIN_MAX_RESPONSE_BYTES,
-        u64_to_usize(GET_BLOCKS_BIN_MAX_TX_COUNT),
-    )
-    .await?;
+    let (blocks, output_indices, block_metrics, index_metrics, scanpack_hit) =
+        legacy_blocks_and_indices(
+            &mut state,
+            response_start_height,
+            chain_height,
+            block_count,
+            prune,
+            no_miner_tx,
+            GET_BLOCKS_BIN_MAX_RESPONSE_BYTES,
+            u64_to_usize(GET_BLOCKS_BIN_MAX_TX_COUNT),
+        )
+        .await?;
     eprintln!(
-        "[RPC] GetBlocks: {} blocks, pruned={}, start={}, current_height={}",
+        "[RPC] GetBlocks: {} blocks, pruned={}, start={}, current_height={}, scanpack_hit={}",
         blocks.len(),
         prune,
         response_start_height,
-        usize_to_u64(chain_height)
+        usize_to_u64(chain_height),
+        scanpack_hit,
     );
     eprintln!(
         "[TIMING] block_fetch: {:.1}ms ({} blocks)",
         t_blocks.elapsed().as_secs_f64() * 1000.0,
         blocks.len()
     );
-    let t_oi = Instant::now();
-    let (output_indices, index_metrics) =
-        output_indices_for_blocks_with_metrics(&mut state, &blocks, no_miner_tx).await?;
     eprintln!(
         "[TIMING] output_indices_total: {:.1}ms",
-        t_oi.elapsed().as_secs_f64() * 1000.0
+        index_metrics.parse_ms + index_metrics.database_ms + index_metrics.reconstruct_ms
     );
     eprintln!(
-        "[SYNC_TRACE_SERVER_BIN_BLOCKS] start={} n_blocks={} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={}",
+        "[SYNC_TRACE_SERVER_BIN_BLOCKS] start={} n_blocks={} scanpack_hit={} fetch_ms={:.3} fetch_batches={} fetch_heights_ms={:.3} fetch_db_ms={:.3} fetch_collect_ms={:.3} fetch_txs={} fetch_est_bytes={} idx_ms={:.3} idx_parse_ms={:.3} idx_db_ms={:.3} idx_reconstruct_ms={:.3} idx_txs={} idx_values={}",
         response_start_height,
         blocks.len(),
+        scanpack_hit,
         t_blocks.elapsed().as_secs_f64() * 1000.0,
         block_metrics.batch_count,
         block_metrics.height_vector_ms,
@@ -274,7 +276,7 @@ async fn get_blocks(
         block_metrics.cap_and_collect_ms,
         block_metrics.returned_txs,
         block_metrics.estimated_response_bytes,
-        t_oi.elapsed().as_secs_f64() * 1000.0,
+        index_metrics.parse_ms + index_metrics.database_ms + index_metrics.reconstruct_ms,
         index_metrics.parse_ms,
         index_metrics.database_ms,
         index_metrics.reconstruct_ms,
@@ -299,9 +301,139 @@ fn effective_get_blocks_limit(max_block_count: u64) -> u64 {
     }
 }
 
+/// Serve a legacy `/get_blocks.bin` response from ScanPack only when its
+/// payload is wire-compatible with the request. The locator/reorg decision is
+/// deliberately made by the caller against the canonical chain first.
+async fn legacy_blocks_and_indices(
+    state: &mut CupratedRpcHandler,
+    response_start_height: usize,
+    chain_height: usize,
+    block_count: usize,
+    prune: bool,
+    no_miner_tx: bool,
+    max_response_bytes: usize,
+    max_tx_count: usize,
+) -> Result<
+    (
+        Vec<BlockCompleteEntry>,
+        Vec<BlockOutputIndices>,
+        BlockFetchMetrics,
+        OutputIndicesMetrics,
+        bool,
+    ),
+    Error,
+> {
+    // The builder persists pruned entries with miner output-indices included.
+    // Any other legacy request keeps the established canonical-DB behaviour.
+    if prune && !no_miner_tx {
+        if let Some(store) = &state.wallet_scan_packs {
+            if let Some(pack) = store.load_covering(u64::try_from(response_start_height)?, block_count)? {
+                // Do not change a caller's requested range into a smaller
+                // physical-cache response. A cross-pack request remains a
+                // correct DB fallback until a multi-pack cache reader is
+                // deliberately added and benchmarked.
+                if pack.blocks.len() == block_count {
+                    let (blocks, output_indices, block_metrics, index_metrics) =
+                        capped_scanpack_response(pack, max_response_bytes, max_tx_count)?;
+                    return Ok((blocks, output_indices, block_metrics, index_metrics, true));
+                }
+            }
+        }
+    }
+
+    let (blocks, block_metrics) = capped_block_complete_entries_with_metrics(
+        state,
+        response_start_height,
+        chain_height,
+        block_count,
+        prune,
+        max_response_bytes,
+        max_tx_count,
+    )
+    .await?;
+    let (output_indices, index_metrics) =
+        output_indices_for_blocks_with_metrics(state, &blocks, no_miner_tx).await?;
+    Ok((blocks, output_indices, block_metrics, index_metrics, false))
+}
+
+/// Apply the legacy response caps to already prepared ScanPack data without
+/// reparsing blocks or consulting the blockchain database.
+fn capped_scanpack_response(
+    pack: ScanPack,
+    max_response_bytes: usize,
+    max_tx_count: usize,
+) -> Result<
+    (
+        Vec<BlockCompleteEntry>,
+        Vec<BlockOutputIndices>,
+        BlockFetchMetrics,
+        OutputIndicesMetrics,
+    ),
+    Error,
+> {
+    if pack.blocks.len() != pack.output_indices.len() {
+        return Err(anyhow!("scan pack block/index count mismatch"));
+    }
+
+    let mut blocks = Vec::with_capacity(pack.blocks.len());
+    let mut output_indices = Vec::with_capacity(pack.output_indices.len());
+    let mut response_bytes = 0_usize;
+    let mut tx_count = 0_usize;
+    let mut block_metrics = BlockFetchMetrics::default();
+
+    for (block, indices) in pack.blocks.into_iter().zip(pack.output_indices) {
+        let block_response_bytes = block_response_bytes(&block);
+        let block_tx_count = block.txs.len();
+        if !blocks.is_empty()
+            && (response_bytes.saturating_add(block_response_bytes) > max_response_bytes
+                || tx_count.saturating_add(block_tx_count) > max_tx_count)
+        {
+            block_metrics.limited_by_response_size =
+                response_bytes.saturating_add(block_response_bytes) > max_response_bytes;
+            block_metrics.limited_by_tx_count =
+                tx_count.saturating_add(block_tx_count) > max_tx_count;
+            break;
+        }
+        response_bytes = response_bytes.saturating_add(block_response_bytes);
+        tx_count = tx_count.saturating_add(block_tx_count);
+        blocks.push(block);
+        output_indices.push(indices);
+    }
+
+    block_metrics.returned_blocks = blocks.len();
+    block_metrics.returned_txs = tx_count;
+    block_metrics.estimated_response_bytes = response_bytes;
+    let index_metrics = OutputIndicesMetrics {
+        blocks: output_indices.len(),
+        transactions: output_indices.iter().map(|block| block.indices.len()).sum(),
+        output_index_values: output_indices
+            .iter()
+            .flat_map(|block| &block.indices)
+            .map(|tx| tx.indices.len())
+            .sum(),
+        ..OutputIndicesMetrics::default()
+    };
+    Ok((blocks, output_indices, block_metrics, index_metrics))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::effective_get_blocks_limit;
+    use super::{capped_scanpack_response, effective_get_blocks_limit};
+    use crate::rpc::scanpack::ScanPack;
+    use cuprate_types::{rpc::{BlockOutputIndices, TxOutputIndices}, BlockCompleteEntry};
+
+    fn scanpack(block_count: usize) -> ScanPack {
+        ScanPack::new(
+            100,
+            (0..block_count).map(|_| BlockCompleteEntry::default()).collect(),
+            (0..block_count)
+                .map(|_| BlockOutputIndices {
+                    indices: vec![TxOutputIndices { indices: vec![7, 11] }],
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn getblocks_zero_uses_monero_legacy_default() {
@@ -312,6 +444,28 @@ mod tests {
     fn getblocks_explicit_limit_is_preserved_up_to_cuprate_ceiling() {
         assert_eq!(effective_get_blocks_limit(750), 750);
         assert_eq!(effective_get_blocks_limit(20_000), 10_000);
+    }
+
+    #[test]
+    fn prepared_scanpack_keeps_block_index_alignment() {
+        let (blocks, indices, block_metrics, index_metrics) =
+            capped_scanpack_response(scanpack(2), usize::MAX, usize::MAX).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(indices.len(), 2);
+        assert_eq!(block_metrics.returned_blocks, 2);
+        assert_eq!(block_metrics.database_ms, 0.0);
+        assert_eq!(index_metrics.database_ms, 0.0);
+        assert_eq!(index_metrics.transactions, 2);
+        assert_eq!(index_metrics.output_index_values, 4);
+    }
+
+    #[test]
+    fn prepared_scanpack_respects_the_legacy_response_cap() {
+        let (blocks, indices, block_metrics, _) =
+            capped_scanpack_response(scanpack(2), 300, usize::MAX).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(indices.len(), 1);
+        assert!(block_metrics.limited_by_response_size);
     }
 }
 

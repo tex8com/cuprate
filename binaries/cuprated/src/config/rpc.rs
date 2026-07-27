@@ -205,6 +205,17 @@ config_struct! {
         /// Type     | boolean
         /// Examples | true, false
         pub i_know_what_im_doing_allow_public_grpc: bool,
+
+        /// Optional Linux TCP congestion control algorithm for accepted
+        /// wallet-gRPC connections only, for example `"bbr"`.
+        ///
+        /// This is deliberately scoped to the separate gRPC listener. It
+        /// does not change the system default, P2P node synchronization, or
+        /// bin-RPC sockets. Leave it unset for the kernel default.
+        ///
+        /// Type     | string or omitted
+        /// Examples | "bbr", "cubic"
+        pub tcp_congestion_control: Option<String>,
     }
 }
 
@@ -215,6 +226,7 @@ impl Default for GrpcConfig {
             port: DefaultOrCustom::Default,
             enable: false,
             i_know_what_im_doing_allow_public_grpc: false,
+            tcp_congestion_control: None,
         }
     }
 }

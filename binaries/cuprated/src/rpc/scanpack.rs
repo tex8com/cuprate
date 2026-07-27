@@ -11,6 +11,7 @@ use std::{
     ops::Bound,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,7 @@ const FORMAT_VERSION: u32 = 1;
 const MAX_PACK_BLOCKS: usize = 10_000;
 const MAX_ITEM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INDICES_PER_TX: usize = 1_000_000;
+const BUILDER_STATUS_FILE: &str = "scanpack-status.env";
 
 /// One immutable, height-contiguous wallet scan pack.
 #[derive(Debug, Clone)]
@@ -135,7 +137,7 @@ impl ScanPackStore {
             (previous, next_start)
         };
         if let Some(path) = previous {
-            let pack = read_pack(&path)?;
+            let pack = read_pack_metadata(&path)?;
             if pack.end_height > minimum_height {
                 return Ok(Some(minimum_height));
             }
@@ -166,14 +168,70 @@ impl ScanPackStore {
         count
     }
 
-    /// Once a cache has at least one package, defer an incomplete newest tail
-    /// until it forms a full package. This keeps immutable rolling caches from
-    /// creating one tiny file for every newly mined block; the newest short
-    /// tail safely uses the ordinary DB fallback in the meantime.
-    pub fn should_defer_short_tail(&self, height: u64, end: u64, count: usize, chunk_blocks: usize) -> bool {
-        count < chunk_blocks
-            && height.saturating_add(u64::try_from(count).unwrap_or(u64::MAX)) == end
-            && !self.packs.read().expect("scan pack index lock poisoned").is_empty()
+    /// Return the unique incomplete tail package, if one exists.
+    pub fn newest_short_tail(&self, chunk_blocks: usize) -> Result<Option<(u64, u64)>> {
+        let entry = self.packs.read().expect("scan pack index lock poisoned")
+            .last_key_value().map(|(start, path)| (*start, path.clone()));
+        let Some((start, path)) = entry else { return Ok(None); };
+        let pack = read_pack_metadata(&path)?;
+        Ok((pack.block_count < chunk_blocks).then_some((start, pack.end_height)))
+    }
+
+    /// Atomically update the newest short package. It can be promoted to a
+    /// complete package, but an already complete package is never rewritten.
+    pub fn replace_short_tail(&self, pack: &ScanPack, chunk_blocks: usize) -> Result<()> {
+        let (previous, next_start, existing_path) = {
+            let packs = self.packs.read().expect("scan pack index lock poisoned");
+            let previous = packs.range((Bound::Unbounded, Bound::Excluded(pack.start_height)))
+                .next_back().map(|(_, path)| path.clone());
+            let next_start = packs.range((Bound::Excluded(pack.start_height), Bound::Unbounded))
+                .next().map(|(start, _)| *start);
+            (previous, next_start, packs.get(&pack.start_height).cloned())
+        };
+        let Some(final_path) = existing_path else {
+            bail!("no short scan pack exists at height {}", pack.start_height);
+        };
+        if read_pack_metadata(&final_path)?.block_count >= chunk_blocks {
+            bail!("refusing to replace complete scan pack at height {}", pack.start_height);
+        }
+        if let Some(path) = previous {
+            let previous = read_pack_metadata(&path)?;
+            if previous.end_height > pack.start_height {
+                bail!("replacement scan pack at {} overlaps preceding pack ending at {}", pack.start_height, previous.end_height);
+            }
+        }
+        if let Some(next_start) = next_start {
+            if pack.end_height > next_start {
+                bail!("replacement scan pack ending at {} overlaps following pack at {}", pack.end_height, next_start);
+            }
+        }
+        let temporary_path = self.directory.join(format!(".pack-{:020}.tmp", pack.start_height));
+        write_pack(&temporary_path, pack)?;
+        fs::rename(&temporary_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Persist observable builder progress without requiring journal access.
+    pub fn write_builder_status(&self, tip_end: u64, covered_until: u64, live_tail: Option<(u64, u64)>, written_packs: u64, result: &str) -> Result<()> {
+        let temporary_path = self.directory.join(".scanpack-status.tmp");
+        let final_path = self.directory.join(BUILDER_STATUS_FILE);
+        let updated = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (tail_start, tail_end) = live_tail.map(|(start, end)| (start.to_string(), end.to_string()))
+            .unwrap_or_else(|| ("none".to_owned(), "none".to_owned()));
+        let mut writer = BufWriter::new(File::create(&temporary_path)?);
+        writeln!(writer, "schema=cuprate_scanpack_builder_status_v1")?;
+        writeln!(writer, "updated_unix_seconds={updated}")?;
+        writeln!(writer, "result={result}")?;
+        writeln!(writer, "tip_height_exclusive={tip_end}")?;
+        writeln!(writer, "covered_until_exclusive={covered_until}")?;
+        writeln!(writer, "missing_blocks={}", tip_end.saturating_sub(covered_until))?;
+        writeln!(writer, "live_tail_start={tail_start}")?;
+        writeln!(writer, "live_tail_end_exclusive={tail_end}")?;
+        writeln!(writer, "written_packs_this_pass={written_packs}")?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        fs::rename(&temporary_path, &final_path)?;
+        Ok(())
     }
 
     pub fn load_covering(&self, height: u64, max_blocks: usize) -> Result<Option<ScanPack>> {
@@ -193,7 +251,7 @@ impl ScanPackStore {
         let path = self.packs.read().expect("scan pack index lock poisoned")
             .range((Bound::Unbounded, Bound::Included(height))).next_back().map(|(_, path)| path.clone());
         let Some(path) = path else { return Ok(None); };
-        let pack = read_pack(&path)?;
+        let pack = read_pack_metadata(&path)?;
         Ok((pack.start_height <= height && height < pack.end_height).then_some(pack.end_height))
     }
 
@@ -214,7 +272,7 @@ impl ScanPackStore {
             (previous, next_start)
         };
         if let Some(path) = previous {
-            let previous = read_pack(&path)?;
+            let previous = read_pack_metadata(&path)?;
             if previous.end_height > pack.start_height {
                 bail!(
                     "scan pack at {} overlaps preceding pack ending at {}",
@@ -256,7 +314,7 @@ impl ScanPackStore {
         let mut stale = Vec::new();
 
         'entries: for (start, path) in entries {
-            let pack = read_pack(&path)?;
+            let pack = read_pack_metadata(&path)?;
             loop {
                 let Some((_, retained_end, _)) = retained.last() else {
                     retained.push((start, pack.end_height, path));
@@ -300,8 +358,8 @@ impl ScanPackStore {
         let mut stale = Vec::new();
         let mut found_full_pack = false;
         for (_, path) in entries.iter().rev() {
-            let pack = read_pack(path)?;
-            if pack.blocks.len() >= chunk_blocks {
+            let pack = read_pack_metadata(path)?;
+            if pack.block_count >= chunk_blocks {
                 found_full_pack = true;
                 break;
             }
@@ -327,7 +385,7 @@ impl ScanPackStore {
             .iter().filter_map(|(start, path)| (*start < height).then(|| (*start, path.clone()))).collect();
         let mut removed = 0;
         for (start, path) in stale {
-            let pack = read_pack(&path)?;
+            let pack = read_pack_metadata(&path)?;
             if pack.end_height <= height {
                 fs::remove_file(&path)?;
                 self.packs.write().expect("scan pack index lock poisoned").remove(&start);
@@ -363,13 +421,33 @@ fn write_pack(path: &Path, pack: &ScanPack) -> Result<()> {
     writer.flush()?; writer.get_ref().sync_all()?; Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScanPackMetadata {
+    start_height: u64,
+    end_height: u64,
+    block_count: usize,
+}
+
+fn read_pack_metadata_from(reader: &mut impl Read) -> Result<ScanPackMetadata> {
+    let mut magic = [0; 8]; reader.read_exact(&mut magic)?; if &magic != MAGIC { bail!("invalid scan pack magic") }
+    if read_u32(reader)? != FORMAT_VERSION { bail!("unsupported scan pack version") }
+    let start_height = read_u64(reader)?; let end_height = read_u64(reader)?;
+    let count = usize::try_from(read_u32(reader)?)?; if count == 0 || count > MAX_PACK_BLOCKS { bail!("invalid scan pack block count") }
+    if end_height.checked_sub(start_height) != Some(u64::try_from(count)?) { bail!("scan pack height interval mismatch") }
+    Ok(ScanPackMetadata { start_height, end_height, block_count: count })
+}
+
+fn read_pack_metadata(path: &Path) -> Result<ScanPackMetadata> {
+    let mut reader = BufReader::new(File::open(path)?);
+    read_pack_metadata_from(&mut reader)
+}
+
 fn read_pack(path: &Path) -> Result<ScanPack> {
     let mut reader = BufReader::new(File::open(path)?);
-    let mut magic = [0; 8]; reader.read_exact(&mut magic)?; if &magic != MAGIC { bail!("invalid scan pack magic") }
-    if read_u32(&mut reader)? != FORMAT_VERSION { bail!("unsupported scan pack version") }
-    let start_height = read_u64(&mut reader)?; let end_height = read_u64(&mut reader)?;
-    let count = usize::try_from(read_u32(&mut reader)?)?; if count == 0 || count > MAX_PACK_BLOCKS { bail!("invalid scan pack block count") }
-    if end_height.checked_sub(start_height) != Some(u64::try_from(count)?) { bail!("scan pack height interval mismatch") }
+    let metadata = read_pack_metadata_from(&mut reader)?;
+    let start_height = metadata.start_height;
+    let end_height = metadata.end_height;
+    let count = metadata.block_count;
     let mut blocks = Vec::with_capacity(count); let mut output_indices = Vec::with_capacity(count);
     for _ in 0..count {
         let mut pruned = [0; 1]; reader.read_exact(&mut pruned)?; let block_weight = read_u64(&mut reader)?; let block = Bytes::from(read_bytes(&mut reader)?);
@@ -409,6 +487,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap(); let store = store(directory.path().to_path_buf());
         let pack = pack(100, 2);
         store.write(&pack).unwrap(); let read = store.load_covering(101, 10).unwrap().unwrap(); assert_eq!(read.start_height, 101); assert_eq!(read.end_height, 102); assert_eq!(read.blocks.len(), 1); assert_eq!(store.covering_end(101).unwrap(), Some(102));
+    }
+
+    #[test]
+    fn metadata_reads_only_the_fixed_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pack.mwsp");
+        write_pack(&path, &pack(100, 2)).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..32]).unwrap();
+
+        let metadata = read_pack_metadata(&path).unwrap();
+        assert_eq!(metadata.start_height, 100);
+        assert_eq!(metadata.end_height, 102);
+        assert_eq!(metadata.block_count, 2);
+        assert!(read_pack(&path).is_err());
+    }
+
+    #[test]
+    fn covering_end_reads_only_the_fixed_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path().to_path_buf());
+        store.write(&pack(100, 2)).unwrap();
+        let path = directory.path().join("pack-00000000000000000100.mwsp");
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..32]).unwrap();
+
+        assert_eq!(store.covering_end(101).unwrap(), Some(102));
+        assert!(store.load_covering(101, 1).is_err());
     }
 
     #[test]
@@ -455,12 +561,26 @@ mod tests {
     }
 
     #[test]
-    fn rolling_window_defers_a_short_newest_tail() {
+    fn short_tail_is_replaced_then_promoted() {
         let directory = tempfile::tempdir().unwrap();
-        let empty = store(directory.path().to_path_buf());
-        assert!(!empty.should_defer_short_tail(100, 101, 1, 1_000));
-        empty.write(&pack(100, 2)).unwrap();
-        assert!(empty.should_defer_short_tail(102, 103, 1, 1_000));
+        let store = store(directory.path().to_path_buf());
+        store.write(&pack(100, 2)).unwrap();
+        store.write(&pack(102, 1)).unwrap();
+        assert_eq!(store.newest_short_tail(2).unwrap(), Some((102, 103)));
+        store.replace_short_tail(&pack(102, 2), 2).unwrap();
+        assert_eq!(store.newest_short_tail(2).unwrap(), None);
+        assert_eq!(store.covering_end(102).unwrap(), Some(104));
+    }
+
+    #[test]
+    fn writes_readable_builder_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path().to_path_buf());
+        store.write_builder_status(105, 105, Some((102, 105)), 1, "complete").unwrap();
+        let status = fs::read_to_string(directory.path().join(BUILDER_STATUS_FILE)).unwrap();
+        assert!(status.contains("tip_height_exclusive=105"));
+        assert!(status.contains("missing_blocks=0"));
+        assert!(status.contains("live_tail_start=102"));
     }
 
     #[test]
