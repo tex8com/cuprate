@@ -40,11 +40,52 @@ service BlockStream {
   // end-of-stream.
   rpc StreamBlocks(StreamBlocksRequest) returns (stream BlockChunk);
 
+  // Resolve a public blockchain-anchored MFW name. The server only returns
+  // derived, owner-signed public data. Clients MUST reject every status except
+  // MFW_NAME_STATUS_FINALIZED before preparing a payment.
+  rpc ResolveMfwName(ResolveMfwNameRequest) returns (ResolveMfwNameResponse);
+
   // Future: streaming hash-only sync (replaces bin `get_hashes` for the
   // fast_refresh phase). Not implemented yet — the wallet still uses the
   // BlockHashInRange DIRECT-BULK path via bin RPC, which is already fast
   // enough (~12 ms per 100k hashes).
   // rpc StreamHashes(StreamHashesRequest) returns (stream HashChunk);
+}
+
+message ResolveMfwNameRequest {
+  string name = 1;
+}
+
+enum MfwNameStatus {
+  MFW_NAME_STATUS_UNSPECIFIED = 0;
+  MFW_NAME_STATUS_NOT_FOUND = 1;
+  MFW_NAME_STATUS_PROVISIONAL = 2;
+  MFW_NAME_STATUS_FINALIZED = 3;
+  MFW_NAME_STATUS_EXPIRED = 4;
+  MFW_NAME_STATUS_REVOKED = 5;
+  MFW_NAME_STATUS_RESERVED = 6;
+}
+
+message ResolveMfwNameResponse {
+  string canonical_name = 1;
+  MfwNameStatus status = 2;
+  uint32 network = 3;
+  uint32 address_kind = 4;
+  bytes public_spend_key = 5;
+  bytes public_view_key = 6;
+  bytes owner_public_key = 7;
+  uint32 sequence = 8;
+  uint64 record_height = 9;
+  bytes source_txid = 10;
+  uint64 expiry_height = 11;
+  uint64 chain_tip_height = 12;
+  uint64 confirmations = 13;
+  // Canonical owner-signed MFW record bytes. Clients verify this before use.
+  bytes record_payload = 14;
+  // Owner key which signed record_payload (the prior owner for transitions).
+  bytes signing_owner_public_key = 15;
+  bytes record_block_hash = 16;
+  bytes chain_tip_hash = 17;
 }
 
 message StreamBlocksRequest {

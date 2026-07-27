@@ -12,8 +12,8 @@
 
 use std::pin::Pin;
 use std::sync::{
-    OnceLock,
     atomic::{AtomicU64, Ordering},
+    OnceLock,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,19 +23,21 @@ use cuprate_fixed_bytes::ByteArrayVec;
 use cuprate_helper::cast::{u64_to_usize, usize_to_u64};
 use cuprate_rpc_types::bin::GetBlocksResponse;
 use cuprate_types::{
-    BlockCompleteEntry,
     rpc::{BlockOutputIndices, PoolInfoExtent},
+    BlockCompleteEntry,
 };
 use futures::Stream;
 use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Request, Response, Status};
 
+use crate::config::WalletScanCacheConfig;
+use crate::mfw_name_index::SharedNameIndex;
 use crate::rpc::{
     handlers::{bin as bin_handlers, helper as bin_helper},
     CupratedRpcHandler,
 };
-use crate::config::WalletScanCacheConfig;
+use mfw_recipient_protocol::{Network as MfwNetwork, ResolutionStatus};
 
 #[allow(
     clippy::unnecessary_qualifications,
@@ -74,7 +76,9 @@ pub mod proto {
 }
 
 use proto::block_stream_server::{BlockStream, BlockStreamServer};
-use proto::{BlockChunk, StreamBlocksRequest};
+use proto::{
+    BlockChunk, MfwNameStatus, ResolveMfwNameRequest, ResolveMfwNameResponse, StreamBlocksRequest,
+};
 
 const DEFAULT_CHUNK_BLOCKS: usize = 200;
 const MIN_CHUNK_BLOCKS: usize = 16;
@@ -166,6 +170,7 @@ struct QueuedBlockChunk {
 #[derive(Clone)]
 pub struct BlockStreamService {
     pub handler: CupratedRpcHandler,
+    pub mfw_name_index: Option<SharedNameIndex>,
 }
 
 #[tonic::async_trait]
@@ -261,26 +266,113 @@ impl BlockStream for BlockStreamService {
 
         Ok(Response::new(Box::pin(outbound)))
     }
+
+    async fn resolve_mfw_name(
+        &self,
+        request: Request<ResolveMfwNameRequest>,
+    ) -> Result<Response<ResolveMfwNameResponse>, Status> {
+        let index = self
+            .mfw_name_index
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("MFW name index is disabled"))?;
+        if !index.is_ready() {
+            return Err(Status::unavailable(
+                "MFW name index is restoring or catching up",
+            ));
+        }
+        let guard = index.read().await;
+        if !index.is_ready() {
+            return Err(Status::unavailable(
+                "MFW name index changed while resolving",
+            ));
+        }
+        let resolution = guard
+            .resolve(&request.into_inner().name)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let network = match guard.parameters().network {
+            MfwNetwork::Mainnet => 0,
+            MfwNetwork::Testnet => 1,
+            MfwNetwork::Stagenet => 2,
+        };
+        let status = match resolution.status {
+            ResolutionStatus::NotFound => MfwNameStatus::NotFound,
+            ResolutionStatus::Reserved => MfwNameStatus::Reserved,
+            ResolutionStatus::Provisional => MfwNameStatus::Provisional,
+            ResolutionStatus::Finalized => MfwNameStatus::Finalized,
+            ResolutionStatus::Expired => MfwNameStatus::Expired,
+            ResolutionStatus::Revoked => MfwNameStatus::Revoked,
+        };
+        let (address_kind, public_spend_key, public_view_key) =
+            resolution
+                .address
+                .map_or((0, Vec::new(), Vec::new()), |address| {
+                    (
+                        address.kind as u32,
+                        address.public_spend_key.to_vec(),
+                        address.public_view_key.to_vec(),
+                    )
+                });
+        Ok(Response::new(ResolveMfwNameResponse {
+            canonical_name: resolution.name.display_name(),
+            status: status as i32,
+            network,
+            address_kind,
+            public_spend_key,
+            public_view_key,
+            owner_public_key: resolution
+                .owner_public_key
+                .map_or_else(Vec::new, |value| value.to_vec()),
+            sequence: resolution.sequence.unwrap_or(0),
+            record_height: resolution.record_height.unwrap_or(0),
+            source_txid: resolution
+                .source_txid
+                .map_or_else(Vec::new, |value| value.to_vec()),
+            expiry_height: resolution.expiry_height.unwrap_or(0),
+            chain_tip_height: resolution.chain_tip_height.unwrap_or(0),
+            confirmations: resolution.confirmations,
+            record_payload: resolution.record_payload.unwrap_or_default(),
+            signing_owner_public_key: resolution
+                .signing_owner_public_key
+                .map_or_else(Vec::new, |value| value.to_vec()),
+            record_block_hash: resolution
+                .record_block_hash
+                .map_or_else(Vec::new, |value| value.to_vec()),
+            chain_tip_hash: resolution
+                .chain_tip_hash
+                .map_or_else(Vec::new, |value| value.to_vec()),
+        }))
+    }
 }
 
 /// Build missing scan packs without blocking RPC serving. Existing packs are
 /// immutable; a positive `max_blocks` turns the directory into a moving window.
 pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanCacheConfig) {
-    let Some(store) = state.wallet_scan_packs.clone() else { return; };
-    if !config.build_on_start { return; }
-    let chunk_blocks = config.chunk_blocks.clamp(MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS);
+    let Some(store) = state.wallet_scan_packs.clone() else {
+        return;
+    };
+    if !config.build_on_start {
+        return;
+    }
+    let chunk_blocks = config
+        .chunk_blocks
+        .clamp(MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS);
     tokio::spawn(async move {
         loop {
             let Ok((top_height, _)) = bin_helper::top_height(&mut state).await else {
                 eprintln!("[SCANPACK] unable to obtain chain tip; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(config.build_poll_seconds.max(1))).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    config.build_poll_seconds.max(1),
+                ))
+                .await;
                 continue;
             };
             let end = top_height.saturating_add(1);
             let mut result = "complete";
             let start = store.logical_start_height(end);
             match store.remove_before(start) {
-                Ok(removed) if removed > 0 => eprintln!("[SCANPACK] evicted {removed} packs below height {start}"),
+                Ok(removed) if removed > 0 => {
+                    eprintln!("[SCANPACK] evicted {removed} packs below height {start}")
+                }
                 Ok(_) => (),
                 Err(error) => eprintln!("[SCANPACK] eviction error: {error:#}"),
             }
@@ -303,7 +395,9 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                     }
                     Ok(_) => (),
                     Err(error) => {
-                        eprintln!("[SCANPACK] coverage inspection error at height {height}: {error:#}");
+                        eprintln!(
+                            "[SCANPACK] coverage inspection error at height {height}: {error:#}"
+                        );
                         result = "coverage_inspection_error";
                         break;
                     }
@@ -318,30 +412,43 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                 let is_short_tail = count < chunk_blocks
                     && height.saturating_add(u64::try_from(count).unwrap_or(u64::MAX)) == end;
                 match bin_handlers::capped_wallet_scan_range_with_metrics(
-                    &mut state, usize::try_from(height).unwrap(), usize::try_from(end).unwrap(), count,
-                    true, false, MAX_GRPC_CHUNK_RESPONSE_BYTES, MAX_GRPC_CHUNK_TX_COUNT,
-                ).await {
-                    Ok((blocks, output_indices, _, _, _)) => match crate::rpc::scanpack::ScanPack::new(height, blocks, output_indices).and_then(|pack| {
-                        let pack_end = pack.end_height;
-                        if replace_live_tail {
-                            store.replace_short_tail(&pack, chunk_blocks)?;
-                        } else {
-                            store.write(&pack)?;
+                    &mut state,
+                    usize::try_from(height).unwrap(),
+                    usize::try_from(end).unwrap(),
+                    count,
+                    true,
+                    false,
+                    MAX_GRPC_CHUNK_RESPONSE_BYTES,
+                    MAX_GRPC_CHUNK_TX_COUNT,
+                )
+                .await
+                {
+                    Ok((blocks, output_indices, _, _, _)) => {
+                        match crate::rpc::scanpack::ScanPack::new(height, blocks, output_indices)
+                            .and_then(|pack| {
+                                let pack_end = pack.end_height;
+                                if replace_live_tail {
+                                    store.replace_short_tail(&pack, chunk_blocks)?;
+                                } else {
+                                    store.write(&pack)?;
+                                }
+                                Ok(pack_end)
+                            }) {
+                            Ok(pack_end) => {
+                                written_packs += 1;
+                                height = pack_end;
+                                live_tail = is_short_tail.then_some((pack_start, pack_end));
+                                if written_packs % 16 == 0 {
+                                    eprintln!("[SCANPACK] built {written_packs} packs; next_height={height} tip={end}");
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("[SCANPACK] write error at height {height}: {error:#}");
+                                result = "write_error";
+                                break;
+                            }
                         }
-                        Ok(pack_end)
-                    }) {
-                        Ok(pack_end) => {
-                            written_packs += 1;
-                            height = pack_end;
-                            live_tail = is_short_tail.then_some((pack_start, pack_end));
-                            if written_packs % 16 == 0 { eprintln!("[SCANPACK] built {written_packs} packs; next_height={height} tip={end}"); }
-                        }
-                        Err(error) => {
-                            eprintln!("[SCANPACK] write error at height {height}: {error:#}");
-                            result = "write_error";
-                            break;
-                        }
-                    },
+                    }
                     Err(error) => {
                         eprintln!("[SCANPACK] build error at height {height}: {error:#}");
                         result = "build_error";
@@ -350,11 +457,16 @@ pub fn spawn_scanpack_builder(mut state: CupratedRpcHandler, config: WalletScanC
                 }
                 tokio::task::yield_now().await;
             }
-            if let Err(error) = store.write_builder_status(end, height, live_tail, written_packs, result) {
+            if let Err(error) =
+                store.write_builder_status(end, height, live_tail, written_packs, result)
+            {
                 eprintln!("[SCANPACK] status write error: {error:#}");
             }
             eprintln!("[SCANPACK] status: result={result} written={written_packs} covered_until={height} tip={end} missing={} live_tail={:?}", end.saturating_sub(height), live_tail);
-            tokio::time::sleep(std::time::Duration::from_secs(config.build_poll_seconds.max(1))).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                config.build_poll_seconds.max(1),
+            ))
+            .await;
         }
     });
 }
@@ -383,7 +495,9 @@ async fn fetch_chunk(
 
     let mut want = chunk_blocks.min(target_end - start);
     let cache_start = match &state.wallet_scan_packs {
-        Some(store) => store.first_available_height(store.logical_start_height(u64::try_from(target_end)?))?,
+        Some(store) => {
+            store.first_available_height(store.logical_start_height(u64::try_from(target_end)?))?
+        }
         None => None,
     };
     // Do not let a legacy response cross into the first cached height. The
@@ -399,19 +513,37 @@ async fn fetch_chunk(
     if let (Some(store), Some(cache_start)) = (&state.wallet_scan_packs, cache_start) {
         if u64::try_from(start)? >= cache_start {
             if let Some(pack) = store.load_covering(u64::try_from(start)?, want)? {
-            let block_count = pack.blocks.len();
-            let tx_count = pack.blocks.iter().map(|block| block.txs.len()).sum();
-            let index_values = pack.output_indices.iter().flat_map(|block| &block.indices)
-                .map(|tx| tx.indices.len()).sum();
-            return Ok(Some(FetchedChunk {
-                top_h, chain_height, target_end, start, blocks: pack.blocks, top_ms,
-                fetch_ms: t_fetch.elapsed().as_secs_f64() * 1000.0,
-                fetch_metrics: bin_handlers::BlockFetchMetrics { returned_blocks: block_count, returned_txs: tx_count, ..Default::default() },
-                prepared_output_indices: Some(pack.output_indices),
-                prepared_index_metrics: Some(bin_handlers::OutputIndicesMetrics { blocks: block_count, transactions: tx_count, output_index_values: index_values, ..Default::default() }),
-                range_read: false,
-                scanpack_hit: true,
-            }));
+                let block_count = pack.blocks.len();
+                let tx_count = pack.blocks.iter().map(|block| block.txs.len()).sum();
+                let index_values = pack
+                    .output_indices
+                    .iter()
+                    .flat_map(|block| &block.indices)
+                    .map(|tx| tx.indices.len())
+                    .sum();
+                return Ok(Some(FetchedChunk {
+                    top_h,
+                    chain_height,
+                    target_end,
+                    start,
+                    blocks: pack.blocks,
+                    top_ms,
+                    fetch_ms: t_fetch.elapsed().as_secs_f64() * 1000.0,
+                    fetch_metrics: bin_handlers::BlockFetchMetrics {
+                        returned_blocks: block_count,
+                        returned_txs: tx_count,
+                        ..Default::default()
+                    },
+                    prepared_output_indices: Some(pack.output_indices),
+                    prepared_index_metrics: Some(bin_handlers::OutputIndicesMetrics {
+                        blocks: block_count,
+                        transactions: tx_count,
+                        output_index_values: index_values,
+                        ..Default::default()
+                    }),
+                    range_read: false,
+                    scanpack_hit: true,
+                }));
             }
         }
     }
@@ -419,17 +551,17 @@ async fn fetch_chunk(
     let (blocks, fetch_metrics, prepared_output_indices, prepared_index_metrics, range_read) =
         if range_requested {
             let (blocks, output_indices, fetch_metrics, index_metrics, range_read) =
-            bin_handlers::capped_wallet_scan_range_with_metrics(
-                &mut state,
-                start,
-                chain_height,
-                want,
-                prune,
-                no_miner_tx,
-                MAX_GRPC_CHUNK_RESPONSE_BYTES,
-                MAX_GRPC_CHUNK_TX_COUNT,
-            )
-            .await?;
+                bin_handlers::capped_wallet_scan_range_with_metrics(
+                    &mut state,
+                    start,
+                    chain_height,
+                    want,
+                    prune,
+                    no_miner_tx,
+                    MAX_GRPC_CHUNK_RESPONSE_BYTES,
+                    MAX_GRPC_CHUNK_TX_COUNT,
+                )
+                .await?;
             (
                 blocks,
                 fetch_metrics,
@@ -439,14 +571,14 @@ async fn fetch_chunk(
             )
         } else {
             let (blocks, fetch_metrics) = bin_handlers::capped_block_complete_entries_with_metrics(
-            &mut state,
-            start,
-            chain_height,
-            want,
-            prune,
-            MAX_GRPC_CHUNK_RESPONSE_BYTES,
-            MAX_GRPC_CHUNK_TX_COUNT,
-        )
+                &mut state,
+                start,
+                chain_height,
+                want,
+                prune,
+                MAX_GRPC_CHUNK_RESPONSE_BYTES,
+                MAX_GRPC_CHUNK_TX_COUNT,
+            )
             .await?;
             (blocks, fetch_metrics, None, None, false)
         };
@@ -484,13 +616,12 @@ async fn index_chunk(
         });
     }
     let t_idx = Instant::now();
-    let (output_indices, index_metrics) =
-        bin_handlers::output_indices_for_blocks_with_metrics(
-            &mut state,
-            &fetched.blocks,
-            no_miner_tx,
-        )
-        .await?;
+    let (output_indices, index_metrics) = bin_handlers::output_indices_for_blocks_with_metrics(
+        &mut state,
+        &fetched.blocks,
+        no_miner_tx,
+    )
+    .await?;
 
     Ok(IndexedChunk {
         fetched,
@@ -516,12 +647,13 @@ async fn produce_block_stream(
     let mut total_blocks: u64 = 0;
     let mut total_bytes: u64 = 0;
     let pipeline_depth = stream_pipeline_depth();
-    let mut prefetched: Option<tokio::task::JoinHandle<Result<Option<FetchedChunk>, Error>>> =
-        None;
+    let mut prefetched: Option<tokio::task::JoinHandle<Result<Option<FetchedChunk>, Error>>> = None;
 
     loop {
         let fetched = match prefetched.take() {
-            Some(task) => task.await.map_err(|error| Error::msg(error.to_string()))??,
+            Some(task) => task
+                .await
+                .map_err(|error| Error::msg(error.to_string()))??,
             None => {
                 fetch_chunk(
                     state.clone(),
@@ -642,12 +774,12 @@ async fn produce_block_stream(
         let permit = match tx.reserve().await {
             Ok(permit) => permit,
             Err(_) => {
-            let total_ms = stream_t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
+                let total_ms = stream_t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
                 "[GRPC StreamBlocks] CLOSE id={} reason=client_disconnect chunks={} blocks={} bytes={} total_ms={:.1}",
                 server_req_id, chunk_seq, total_blocks, total_bytes, total_ms,
             );
-            return Ok(());
+                return Ok(());
             }
         };
         let send_ms = t_send.elapsed().as_secs_f64() * 1000.0;
@@ -701,8 +833,14 @@ async fn produce_block_stream(
 }
 
 /// Build the tonic gRPC service ready to be added to a tonic Server.
-pub fn block_stream_service(handler: CupratedRpcHandler) -> BlockStreamServer<BlockStreamService> {
-    BlockStreamServer::new(BlockStreamService { handler })
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+pub fn block_stream_service(
+    handler: CupratedRpcHandler,
+    mfw_name_index: Option<SharedNameIndex>,
+) -> BlockStreamServer<BlockStreamService> {
+    BlockStreamServer::new(BlockStreamService {
+        handler,
+        mfw_name_index,
+    })
+    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }

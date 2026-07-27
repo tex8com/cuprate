@@ -42,6 +42,7 @@ mod commands;
 mod config;
 mod constants;
 mod logging;
+mod mfw_name_index;
 mod p2p;
 mod rpc;
 mod signals;
@@ -112,6 +113,12 @@ fn main() {
         )
         .await;
 
+        let mfw_name_index = mfw_name_index::start_from_environment(
+            config.network(),
+            blockchain_read_handle.clone(),
+        )
+        .expect("invalid or unsafe MFW name-index configuration");
+
         // Start the context service and the block/tx verifier.
         let context_svc =
             blockchain::init_consensus(blockchain_read_handle.clone(), config.context_config())
@@ -179,6 +186,7 @@ fn main() {
             context_svc.clone(),
             txpool_read_handle.clone(),
             tx_handler.clone(),
+            mfw_name_index,
         );
 
         // Start Tor P2P zone after sync completes.

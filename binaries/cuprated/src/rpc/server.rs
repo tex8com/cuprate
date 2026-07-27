@@ -24,7 +24,10 @@ use cuprate_txpool::service::TxpoolReadHandle;
 
 use crate::{
     config::{grpc_rpc_port, restricted_rpc_port, unrestricted_rpc_port, GrpcConfig, RpcConfig},
-    rpc::{grpc, rpc_handler::BlockchainManagerHandle, scanpack::ScanPackStore, CupratedRpcHandler},
+    mfw_name_index::SharedNameIndex,
+    rpc::{
+        grpc, rpc_handler::BlockchainManagerHandle, scanpack::ScanPackStore, CupratedRpcHandler,
+    },
     txpool::IncomingTxHandler,
 };
 
@@ -42,15 +45,18 @@ pub fn init_rpc_servers(
     blockchain_context: BlockchainContextService,
     txpool_read: TxpoolReadHandle,
     tx_handler: IncomingTxHandler,
+    mfw_name_index: Option<SharedNameIndex>,
 ) {
     let wallet_scan_packs = if config.wallet_scan_cache.enable {
-        Some(ScanPackStore::open(
-            config.wallet_scan_cache.directory.clone(),
-            config.wallet_scan_cache.start_height,
-            config.wallet_scan_cache.max_blocks,
-            config.wallet_scan_cache.chunk_blocks,
+        Some(
+            ScanPackStore::open(
+                config.wallet_scan_cache.directory.clone(),
+                config.wallet_scan_cache.start_height,
+                config.wallet_scan_cache.max_blocks,
+                config.wallet_scan_cache.chunk_blocks,
+            )
+            .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")),
         )
-            .unwrap_or_else(|error| panic!("opening wallet scan cache failed: {error:#}")))
     } else {
         None
     };
@@ -137,7 +143,9 @@ pub fn init_rpc_servers(
         let bind = SocketAddr::new(grpc_addr, grpc_port);
         let tcp_congestion_control = config.grpc.tcp_congestion_control.clone();
         tokio::task::spawn(async move {
-            if let Err(e) = run_grpc_server(grpc_handler, bind, tcp_congestion_control).await {
+            if let Err(e) =
+                run_grpc_server(grpc_handler, mfw_name_index, bind, tcp_congestion_control).await
+            {
                 eprintln!("[GRPC] server task exited with error: {e:?}");
             }
         });
@@ -152,6 +160,7 @@ pub fn init_rpc_servers(
 /// occurs. Coexists with the bin RPC axum server on a separate port.
 async fn run_grpc_server(
     rpc_handler: CupratedRpcHandler,
+    mfw_name_index: Option<SharedNameIndex>,
     address: SocketAddr,
     tcp_congestion_control: Option<String>,
 ) -> Result<(), Error> {
@@ -164,7 +173,7 @@ async fn run_grpc_server(
         "Starting gRPC streaming server"
     );
 
-    let svc = grpc::block_stream_service(rpc_handler);
+    let svc = grpc::block_stream_service(rpc_handler, mfw_name_index);
     let listener = TcpListener::bind(address).await?;
     let incoming = TcpListenerStream::new(listener).map(move |connection| {
         let stream = connection?;

@@ -66,6 +66,8 @@ hex-literal           = { workspace = true }
 indexmap              = { workspace = true }
 monero-address        = { workspace = true }
 monero-oxide          = { workspace = true, features = ["std", "compile-time-generators"] }
+monero-rpc            = { workspace = true }
+monero-wallet         = { workspace = true }
 nu-ansi-term          = { workspace = true }
 paste                 = { workspace = true }
 pin-project           = { workspace = true }
@@ -96,6 +98,9 @@ tracing-appender      = { workspace = true }
 tracing-subscriber    = { workspace = true, features = ["std", "fmt", "default"] }
 tracing               = { workspace = true, features = ["default"] }
 libc                  = "0.2"
+ed25519-dalek         = { version = "2" }
+mfw-recipient-protocol = { path = "../../external/mfw-recipient-protocol" }
+zeroize               = { version = "1" }
 
 [dev-dependencies]
 tempfile          = { workspace = true }

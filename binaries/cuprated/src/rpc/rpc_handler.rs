@@ -1,6 +1,9 @@
 //! `cuprated`'s implementation of [`RpcHandler`].
 
-use std::{sync::Arc, task::{Context, Poll}};
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use anyhow::Error;
 use futures::future::BoxFuture;
@@ -19,7 +22,10 @@ use cuprate_rpc_types::{
 use cuprate_txpool::service::TxpoolReadHandle;
 use cuprate_types::BlockTemplate;
 
-use crate::{rpc::{handlers, scanpack::ScanPackStore}, txpool::IncomingTxHandler};
+use crate::{
+    rpc::{handlers, scanpack::ScanPackStore},
+    txpool::IncomingTxHandler,
+};
 
 /// TODO: use real type when public.
 #[derive(Clone)]

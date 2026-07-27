@@ -327,7 +327,9 @@ async fn legacy_blocks_and_indices(
     // Any other legacy request keeps the established canonical-DB behaviour.
     if prune && !no_miner_tx {
         if let Some(store) = &state.wallet_scan_packs {
-            if let Some(pack) = store.load_covering(u64::try_from(response_start_height)?, block_count)? {
+            if let Some(pack) =
+                store.load_covering(u64::try_from(response_start_height)?, block_count)?
+            {
                 // Do not change a caller's requested range into a smaller
                 // physical-cache response. A cross-pack request remains a
                 // correct DB fallback until a multi-pack cache reader is
@@ -420,15 +422,22 @@ fn capped_scanpack_response(
 mod tests {
     use super::{capped_scanpack_response, effective_get_blocks_limit};
     use crate::rpc::scanpack::ScanPack;
-    use cuprate_types::{rpc::{BlockOutputIndices, TxOutputIndices}, BlockCompleteEntry};
+    use cuprate_types::{
+        rpc::{BlockOutputIndices, TxOutputIndices},
+        BlockCompleteEntry,
+    };
 
     fn scanpack(block_count: usize) -> ScanPack {
         ScanPack::new(
             100,
-            (0..block_count).map(|_| BlockCompleteEntry::default()).collect(),
+            (0..block_count)
+                .map(|_| BlockCompleteEntry::default())
+                .collect(),
             (0..block_count)
                 .map(|_| BlockOutputIndices {
-                    indices: vec![TxOutputIndices { indices: vec![7, 11] }],
+                    indices: vec![TxOutputIndices {
+                        indices: vec![7, 11],
+                    }],
                 })
                 .collect(),
         )
