@@ -46,6 +46,7 @@ const INTERVAL_MS_ENV: &str = "CUPRATE_SCANPACK_INTERVAL_MS";
 const DEFAULT_BLOCKS_PER_PACK: u32 = 2_048;
 const DEFAULT_INTERVAL_MS: u64 = 5_000;
 const MAX_BLOCKS_PER_PACK: u32 = 10_000;
+const DATABASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_FILE: &str = ".scanpack-writer.lock";
 const MAGIC: &[u8; 8] = b"MWSPACK1";
 const FORMAT_VERSION: u32 = 1;
@@ -226,7 +227,20 @@ impl<C: ScanPackChain> ScanPackWriter<C> {
         let mut next_height = plan.rebuild_start;
         while next_height < snapshot_end {
             let end_height = next_height.saturating_add(pack_size).min(snapshot_end);
+            tracing::info!(
+                generation,
+                start_height = next_height,
+                end_height,
+                "building signed Cuprate ScanPack package"
+            );
             let data = self.chain.pack(next_height, end_height).await?;
+            tracing::info!(
+                generation,
+                start_height = next_height,
+                end_height,
+                blocks = data.blocks.len(),
+                "finished canonical data read for signed ScanPack package"
+            );
             let descriptor = write_pack_atomic(
                 &self.config.directory,
                 generation,
@@ -439,12 +453,15 @@ trait ScanPackChain: Clone + Send + Sync + 'static {
 #[async_trait]
 impl ScanPackChain for CuprateChain {
     async fn chain_height(&self) -> Result<u64> {
-        let response = self
-            .blockchain_read
-            .clone()
-            .oneshot(BlockchainReadRequest::ChainHeight)
-            .await
-            .context("failed to read Cuprate chain height")?;
+        let response = tokio::time::timeout(
+            DATABASE_REQUEST_TIMEOUT,
+            self.blockchain_read
+                .clone()
+                .oneshot(BlockchainReadRequest::ChainHeight),
+        )
+        .await
+        .context("timed out reading Cuprate chain height")?
+        .context("failed to read Cuprate chain height")?;
         let BlockchainResponse::ChainHeight(height, _) = response else {
             bail!("unexpected Cuprate chain-height response");
         };
@@ -453,12 +470,15 @@ impl ScanPackChain for CuprateChain {
 
     async fn block_hash(&self, height: u64) -> Result<[u8; 32]> {
         let height = usize::try_from(height).context("block height does not fit usize")?;
-        let response = self
-            .blockchain_read
-            .clone()
-            .oneshot(BlockchainReadRequest::BlockHash(height, Chain::Main))
-            .await
-            .context("failed to read canonical Cuprate block hash")?;
+        let response = tokio::time::timeout(
+            DATABASE_REQUEST_TIMEOUT,
+            self.blockchain_read
+                .clone()
+                .oneshot(BlockchainReadRequest::BlockHash(height, Chain::Main)),
+        )
+        .await
+        .context("timed out reading canonical Cuprate block hash")?
+        .context("failed to read canonical Cuprate block hash")?;
         let BlockchainResponse::BlockHash(hash) = response else {
             bail!("unexpected Cuprate block-hash response");
         };
@@ -472,14 +492,17 @@ impl ScanPackChain for CuprateChain {
         let heights = (start_height..end_height)
             .map(|height| usize::try_from(height).context("block height does not fit usize"))
             .collect::<Result<Vec<_>>>()?;
-        let response = self
-            .blockchain_read
-            .clone()
-            .oneshot(BlockchainReadRequest::BlockCompleteEntriesByHeightPruned(
-                heights,
-            ))
-            .await
-            .context("failed to read pruned blocks from Cuprate")?;
+        let response = tokio::time::timeout(
+            DATABASE_REQUEST_TIMEOUT,
+            self.blockchain_read.clone().oneshot(
+                BlockchainReadRequest::BlockCompleteEntriesByHeightPruned(heights),
+            ),
+        )
+        .await
+        .with_context(|| {
+            format!("timed out reading pruned Cuprate blocks for {start_height}..{end_height}")
+        })?
+        .context("failed to read pruned blocks from Cuprate")?;
         let BlockchainResponse::BlockCompleteEntriesByHeight(blocks) = response else {
             bail!("unexpected Cuprate block response");
         };
@@ -501,13 +524,21 @@ impl ScanPackChain for CuprateChain {
             parsed.push(block);
         }
 
-        let response = self
-            .blockchain_read
-            .clone()
-            .oneshot(BlockchainReadRequest::TxOutputIndexesBatch(
-                transaction_hashes,
-            ))
+        let transaction_count = transaction_hashes.len();
+        let response = tokio::time::timeout(
+            DATABASE_REQUEST_TIMEOUT,
+            self.blockchain_read
+                .clone()
+                .oneshot(BlockchainReadRequest::TxOutputIndexesBatch(
+                    transaction_hashes,
+                )),
+        )
             .await
+            .with_context(|| {
+                format!(
+                    "timed out reading {transaction_count} Cuprate output-index lists for {start_height}..{end_height}"
+                )
+            })?
             .context("failed to read transaction output indices from Cuprate")?;
         let BlockchainResponse::TxOutputIndexesBatch(all_indices) = response else {
             bail!("unexpected Cuprate output-index response");
