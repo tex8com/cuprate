@@ -1783,6 +1783,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "futures",
  "hex",
  "hex-literal 1.1.0",
@@ -1803,6 +1804,7 @@ dependencies = [
  "randomx-rs",
  "rayon",
  "safelog",
+ "scanpack-format",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -2523,6 +2525,16 @@ dependencies = [
  "serde",
  "thiserror 2.0.17",
  "walkdir",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -5053,6 +5065,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc984f4f9ceb736a7bb755c3e3bd17dc56370af2600c9780dcc48c66453da34d"
 dependencies = [
  "regex",
+]
+
+[[package]]
+name = "scanpack-format"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

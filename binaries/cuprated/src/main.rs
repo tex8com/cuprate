@@ -45,6 +45,7 @@ mod logging;
 mod mfw_name_index;
 mod p2p;
 mod rpc;
+mod scanpack_writer;
 mod signals;
 mod statics;
 mod tor;
@@ -112,6 +113,9 @@ fn main() {
             config.network(),
         )
         .await;
+
+        scanpack_writer::start_from_environment(config.network(), blockchain_read_handle.clone())
+            .expect("invalid or unsafe Cuprate ScanPack writer configuration");
 
         let mfw_name_index = mfw_name_index::start_from_environment(
             config.network(),

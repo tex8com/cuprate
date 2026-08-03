@@ -99,7 +99,9 @@ tracing-subscriber    = { workspace = true, features = ["std", "fmt", "default"]
 tracing               = { workspace = true, features = ["default"] }
 libc                  = "0.2"
 ed25519-dalek         = { version = "2" }
+fs2                   = { version = "0.4" }
 mfw-recipient-protocol = { path = "../../external/mfw-recipient-protocol" }
+scanpack-format       = { path = "../../external/scanpack-format" }
 zeroize               = { version = "1" }
 
 [dev-dependencies]
