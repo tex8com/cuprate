@@ -39,6 +39,13 @@ pub use peer_set::{ClientDropGuard, PeerSetRequest, PeerSetResponse};
 /// Interval for checking inbound connection status (1 hour)
 const INBOUND_CONNECTION_MONITOR_INTERVAL: Duration = Duration::from_secs(3600);
 
+fn peer_buffer_capacity(max_inbound_connections: usize, outbound_connections: usize) -> usize {
+    max_inbound_connections
+        .checked_add(outbound_connections)
+        .expect("combined inbound and outbound connection limit overflow")
+        .max(1)
+}
+
 /// Monitors for inbound connections and logs a warning if none are detected.
 ///
 /// This task runs every hour to check if there are inbound connections available.
@@ -95,13 +102,14 @@ where
 {
     let address_book =
         cuprate_address_book::init_address_book(config.address_book_config.clone()).await?;
-    let address_book = Buffer::new(
-        address_book,
-        config
-            .max_inbound_connections
-            .checked_add(config.outbound_connections)
-            .unwrap(),
-    );
+    // `outbound_connections = 0` and `max_inbound_connections = 0` is a
+    // supported, useful configuration for an RPC-only node with a fixed local
+    // chain tip (for example a reproducible wallet benchmark). Tower and Tokio
+    // reject zero-capacity buffered services/channels, so retain one internal
+    // slot even though no network connection can consume it.
+    let peer_buffer_capacity =
+        peer_buffer_capacity(config.max_inbound_connections, config.outbound_connections);
+    let address_book = Buffer::new(address_book, peer_buffer_capacity);
 
     // Use the default config. Changing the defaults affects tx fluff times, which could affect D++ so for now don't allow changing
     // this.
@@ -137,12 +145,7 @@ where
 
     let outbound_handshaker = outbound_handshaker_builder.build();
 
-    let (new_connection_tx, new_connection_rx) = mpsc::channel(
-        config
-            .outbound_connections
-            .checked_add(config.max_inbound_connections)
-            .unwrap(),
-    );
+    let (new_connection_tx, new_connection_rx) = mpsc::channel(peer_buffer_capacity);
     let (make_connection_tx, make_connection_rx) = mpsc::channel(3);
 
     let outbound_connector = Connector::new(outbound_handshaker);
@@ -205,6 +208,18 @@ where
         address_book: address_book.boxed_clone(),
         _background_tasks: Arc::new(background_tasks),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_buffer_capacity;
+
+    #[test]
+    fn rpc_only_configuration_keeps_internal_buffer_valid() {
+        assert_eq!(peer_buffer_capacity(0, 0), 1);
+        assert_eq!(peer_buffer_capacity(0, 32), 32);
+        assert_eq!(peer_buffer_capacity(128, 32), 160);
+    }
 }
 
 /// The interface to Monero's P2P network on a certain [`NetworkZone`].
