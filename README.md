@@ -30,6 +30,16 @@ For a production release: make the change locally, test it, commit and push;
 then the server pulls that commit, builds it and deploys the binary. Never edit
 MFN source code on a server.
 
+## Wallet routing contract
+
+MFN exposes a restricted wallet-RPC service and a separate gRPC/ScanPack block
+stream. The first-party wallet preset sends daemon RPC through the selected Tor
+v3 Onion gateway on port `18089`; it uses the Clearnet gRPC/ScanPack endpoint
+on port `18091` only for high-volume block synchronization. Onion publication,
+TLS, firewall rules and public endpoint names are deployment configuration,
+not MFN source-code defaults. A Clearnet block stream remains observable by
+its provider, and users may choose their own node or route instead.
+
 **ScanPack migration:** current MFN writes signed ScanPacks through
 `CUPRATE_SCANPACK_*` environment variables from
 `backend/fast-wallet-stack/deploy/monero-fast-node-fast-wallet-scanpack.conf`.
