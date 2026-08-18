@@ -30,10 +30,16 @@ For a production release: make the change locally, test it, commit and push;
 then the server pulls that commit, builds it and deploys the binary. Never edit
 MFN source code on a server.
 
-**Current production gate:** the checked-in MFN source does not yet include the
-`rpc.wallet_scan_cache` configuration extension required by the deployed Fast
-Wallet configuration. Do not deploy this Node binary to production until that
-fork functionality is restored and an integration build passes.
+**ScanPack migration:** current MFN writes signed ScanPacks through
+`CUPRATE_SCANPACK_*` environment variables from
+`backend/fast-wallet-stack/deploy/monero-fast-node-fast-wallet-scanpack.conf`.
+The old `[rpc.wallet_scan_cache]` TOML table is intentionally unsupported and
+must be removed with the versioned migration script before the first current
+MFN deployment:
+
+```bash
+sudo backend/fast-wallet-stack/deploy/migrate-legacy-wallet-scan-cache.sh
+```
 
 ## TEX8 Fork — Wallet Sync Optimizations (`fast-rpc` branch)
 
