@@ -148,8 +148,11 @@ impl NameIndexConfig {
     }
 
     fn protocol_parameters(&self) -> Result<ProtocolParameters> {
+        // These are protocol/service labels only. Product names, including
+        // `tex8`, are ordinary `.mfw` records and must be derived from the
+        // canonical Monero chain like every other registrable name.
         let reserved_names = [
-            "admin", "api", "help", "mfw", "monero", "security", "support", "tex8", "wallet", "www",
+            "admin", "api", "help", "mfw", "monero", "security", "support", "wallet", "www",
         ]
         .into_iter()
         .map(CanonicalName::parse)
