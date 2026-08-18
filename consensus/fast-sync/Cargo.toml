@@ -1,0 +1,34 @@
+[package]
+name = "cuprate-fast-sync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "create-fs-file"
+path = "src/create.rs"
+
+[dependencies]
+cuprate-blockchain          = { workspace = true }
+cuprate-consensus           = { workspace = true }
+cuprate-consensus-context   = { workspace = true }
+cuprate-hex                 = { workspace = true }
+cuprate-types               = { workspace = true }
+cuprate-p2p                 = { workspace = true }
+cuprate-p2p-core            = { workspace = true }
+
+clap         = { workspace = true, features = ["derive", "std"] }
+hex          = { workspace = true }
+monero-oxide = { workspace = true }
+blake3       = { workspace = true }
+tokio        = { workspace = true, features = ["full"] }
+tower        = { workspace = true }
+serde_json   = { workspace = true }
+
+[dev-dependencies]
+proptest   = { workspace = true }
+tokio-test = { workspace = true }
+tempfile   = { workspace = true }
+
+[lints]
+workspace = true

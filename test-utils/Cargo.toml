@@ -1,0 +1,32 @@
+[package]
+name    = "cuprate-test-utils"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Boog900", "hinto-janai"]
+
+[dependencies]
+cuprate-types             = { workspace = true }
+cuprate-helper            = { workspace = true, features = ["map", "tx"] }
+cuprate-wire              = { workspace = true }
+cuprate-p2p-core          = { workspace = true, features = ["borsh"] }
+
+hex                       = { workspace = true }
+hex-literal               = { workspace = true }
+monero-oxide              = { workspace = true, features = ["std"] }
+monero-simple-request-rpc = { workspace = true }
+monero-rpc                = { workspace = true, features = ["std"] }
+async-trait               = { workspace = true }
+tokio                     = { workspace = true, features = ["full"] }
+serde                     = { workspace = true }
+serde_json                = { workspace = true }
+tempfile                  = { workspace = true }
+paste                     = { workspace = true }
+borsh                     = { workspace = true, features = ["derive"]}
+
+[dev-dependencies]
+hex               = { workspace = true }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

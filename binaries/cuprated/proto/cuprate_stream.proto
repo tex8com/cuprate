@@ -1,0 +1,150 @@
+// Cuprate streaming RPC for high-throughput wallet sync.
+//
+// Coexists side-by-side with the legacy bin RPC (binary epee on HTTP/1.1).
+// Standard wallets keep using bin RPC unchanged; "smart" wallets that opt
+// into this service get HTTP/2 multiplexing + server-streaming, which removes
+// the per-TCP-connection variance ceiling that limits the bin RPC to roughly
+// half of the available link bandwidth.
+//
+// Design choice — payload is epee, transport is gRPC:
+//
+// Each BlockChunk.payload is the same epee-serialized GetBlocksResponse the
+// bin RPC produces (with most fields empty — only blocks, output_indices,
+// start_height, current_height, status are populated). The wallet decodes it
+// with its EXISTING `COMMAND_RPC_GET_BLOCKS_FAST::response` deserializer, so
+// no new payload parser is needed on the wallet side. The protobuf layer is
+// purely the envelope that gives us HTTP/2 multiplexing + flow control +
+// server-streaming. That is where ALL of the network-layer wins come from;
+// the inner serialization format is irrelevant for throughput on crypto
+// payloads (which are near-incompressible regardless).
+//
+// Status: experimental. Wire-compatibility is NOT promised across versions
+// until v1; pin the proto file to the cuprated commit you build against.
+
+syntax = "proto3";
+
+package cuprate.stream.v1;
+
+service BlockStream {
+  // Server-streaming RPC. The server pushes BlockChunks at the rate the
+  // backend can produce them, throttled by HTTP/2 flow control on the
+  // client side. The stream terminates when:
+  //   - stop_height (if set) is reached, OR
+  //   - tip is reached (current chain top served), OR
+  //   - the client cancels the RPC
+  //
+  // The server emits BlockChunks with strictly monotonically increasing
+  // start_heights and contiguous block ranges (no gaps, no overlap). On
+  // chain-tip catch-up the server MAY pause the stream (no chunks) until a
+  // new block is available; the client should not interpret a pause as
+  // end-of-stream.
+  rpc StreamBlocks(StreamBlocksRequest) returns (stream BlockChunk);
+
+  // Resolve a public blockchain-anchored MFW name. The server only returns
+  // derived, owner-signed public data. Clients MUST reject every status except
+  // MFW_NAME_STATUS_FINALIZED before preparing a payment.
+  rpc ResolveMfwName(ResolveMfwNameRequest) returns (ResolveMfwNameResponse);
+
+  // Future: streaming hash-only sync (replaces bin `get_hashes` for the
+  // fast_refresh phase). Not implemented yet — the wallet still uses the
+  // BlockHashInRange DIRECT-BULK path via bin RPC, which is already fast
+  // enough (~12 ms per 100k hashes).
+  // rpc StreamHashes(StreamHashesRequest) returns (stream HashChunk);
+}
+
+message ResolveMfwNameRequest {
+  string name = 1;
+}
+
+enum MfwNameStatus {
+  MFW_NAME_STATUS_UNSPECIFIED = 0;
+  MFW_NAME_STATUS_NOT_FOUND = 1;
+  MFW_NAME_STATUS_PROVISIONAL = 2;
+  MFW_NAME_STATUS_FINALIZED = 3;
+  MFW_NAME_STATUS_EXPIRED = 4;
+  MFW_NAME_STATUS_REVOKED = 5;
+  MFW_NAME_STATUS_RESERVED = 6;
+}
+
+message ResolveMfwNameResponse {
+  string canonical_name = 1;
+  MfwNameStatus status = 2;
+  uint32 network = 3;
+  uint32 address_kind = 4;
+  bytes public_spend_key = 5;
+  bytes public_view_key = 6;
+  bytes owner_public_key = 7;
+  uint32 sequence = 8;
+  uint64 record_height = 9;
+  bytes source_txid = 10;
+  uint64 expiry_height = 11;
+  uint64 chain_tip_height = 12;
+  uint64 confirmations = 13;
+  // Canonical owner-signed MFW record bytes. Clients verify this before use.
+  bytes record_payload = 14;
+  // Owner key which signed record_payload (the prior owner for transitions).
+  bytes signing_owner_public_key = 15;
+  bytes record_block_hash = 16;
+  bytes chain_tip_hash = 17;
+}
+
+message StreamBlocksRequest {
+  // First block height to send (inclusive).
+  uint64 start_height = 1;
+
+  // Last block height to send (inclusive). 0 = stream to current tip.
+  uint64 stop_height = 2;
+
+  // If true, server prunes RCT prunable data before sending (typical wallet
+  // sync — saves ~5x bandwidth). If false, full blocks are sent.
+  bool prune = 3;
+
+  // Hint for preferred chunk size (number of blocks per BlockChunk).
+  // Server may ignore or clamp. 0 uses the server default; the current
+  // safety-bounded implementation permits 16..512 blocks per chunk.
+  uint32 chunk_blocks_hint = 4;
+
+  // If true, miner txs are stripped (parity with bin RPC's no_miner_tx).
+  bool no_miner_tx = 5;
+
+  // Opaque request id supplied by the client, echoed back in every chunk's
+  // PERF log entry on the server. Lets the wallet correlate its own log
+  // lines with server logs without a shared clock. Keep <= 64 chars.
+  string client_request_id = 6;
+
+  // Optional compact chain locator, newest hash first. Each entry is exactly
+  // 32 bytes. When supplied, the server finds the first common block and
+  // streams from that height, matching getblocks.bin reorg semantics.
+  repeated bytes chain_locator = 7;
+}
+
+message BlockChunk {
+  // Height of the first block in this chunk's payload. Subsequent blocks in
+  // this chunk are at start_height+1, start_height+2, ...
+  uint64 start_height = 1;
+
+  // Sequence number of this chunk within the stream (0, 1, 2, ...).
+  // Useful for detecting drops/duplicates in client logs.
+  uint64 chunk_seq = 2;
+
+  // Current chain tip height as observed by the server when this chunk was
+  // emitted. Lets the wallet update its progress bar without a separate
+  // get_info round-trip. Will increase across chunks as new blocks arrive.
+  uint64 chain_tip = 3;
+
+  // Server-side request id (auto-generated if client did not supply one).
+  // Echoed in every chunk so the client can correlate.
+  string server_request_id = 4;
+
+  // The epee-serialized payload — exactly the wire format the bin RPC's
+  // GetBlocks endpoint returns. Most fields are empty/default (no pool
+  // info, no daemon_time, no base.untrusted etc.) — only `blocks`,
+  // `output_indices`, `start_height`, `current_height` and `status` are
+  // populated. Decode on the wallet side with the existing
+  // `COMMAND_RPC_GET_BLOCKS_FAST::response` epee deserializer.
+  bytes payload = 5;
+
+  // For diagnostics/logging only — redundant with payload contents.
+  uint32 n_blocks = 6;
+  uint32 payload_bytes = 7;
+}

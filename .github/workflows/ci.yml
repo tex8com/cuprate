@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  # Show colored output in CI.
+  CARGO_TERM_COLOR: always
+  # Show full panics.
+  RUST_BACKTRACE: "full"
+  # Increase thread stack size to 8 megabytes.
+  RUST_MIN_STACK: 8000000
+  # Fail on documentation warnings.
+  RUSTDOCFLAGS: '-D warnings'
+  # Enable debug information generation for build dependencies.
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: true
+  # Build commands.
+  CMD_DOC: cargo doc --all-features --no-deps
+  CMD_CLIPPY: cargo clippy --all-features --all-targets -- -D warnings
+  CMD_TEST: |
+    # HACK: how to test both DB backends that are feature-gated?
+    cargo test --all-features
+    cargo test --package cuprate-blockchain --no-default-features --features redb
+  CMD_BUILD: cargo build --all-features --all-targets
+  CMD_HACK: |
+    cargo install cargo-hack --locked
+    cargo hack check --feature-powerset --no-dev-deps
+
+jobs:
+  # Run format separately.
+  #
+  # This will fast-cancel other CI early if this fails.
+  #
+  # `cargo fmt` checks _all_ code, regardless of the OS
+  # or any `#[cfg]`'s, so this only needs to run on Linux.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+
+  # Run typo checker separately.
+  # This will fast-cancel other CI early if this fails.
+  typo:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Spell Check
+      uses: crate-ci/typos@master
+
+  # Run 32-bit WASM support check separately.
+  wasm-32-bit-support:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # The list of crates to check for WASM 32 bit support
+        #  TODO: check features.
+        crate: [
+            cuprate-epee-encoding,
+            cuprate-rpc-types,
+            cuprate-fixed-bytes,
+        ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM 32-bit
+        run: cargo build --target wasm32-unknown-unknown --features __not_public_32_bit -p ${{ matrix.crate }}
+
+  # CI, runs on GitHub provided OSs.
+  ci:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [
+            windows-2022, # EOL = 2026-10-13 | <https://endoflife.date/windows-server>
+            macos-15,     # EOL = 2027-09-16 | <https://endoflife.date/macos>
+            ubuntu-22.04, # EOL = 2027-04-01 | <https://endoflife.date/ubuntu>
+            ubuntu-22.04-arm,
+        ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ matrix.os }}
+
+      - name: Download monerod
+        uses: ./.github/actions/monerod-download
+
+      - name: Install dependencies (Windows)
+        if: matrix.os == 'windows-2022'
+        uses: lukka/get-cmake@v3.31.6 # Needed for `randomx-rs`
+
+      - name: Documentation
+        run: ${{ env.CMD_DOC }}
+
+      - name: Clippy (fail on warnings)
+        run: ${{ env.CMD_CLIPPY }}
+
+      - name: Test
+        run: ${{ env.CMD_TEST }}
+
+      - name: Build
+        run: ${{ env.CMD_BUILD }}
+
+      - name: Hack Check
+        run: ${{ env.CMD_HACK }}
+
+  # CI, runs in a Docker image.
+  ci-docker:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.os.image }}
+
+    strategy:
+      matrix:
+        os:
+        # TODO: support musl <https://github.com/Cuprate/cuprate/issues/336>
+        # - { image: alpine:latest, commands: "apk update && apk add alpine-sdk cmake curl bash" }
+        - { image: archlinux:latest, commands: "pacman -Syyu --noconfirm base-devel git cmake openssl" }
+        - { image: debian:stable, commands: "apt update && apt -y install build-essential curl cmake git pkg-config libssl-dev" }
+        - { image: fedora:latest, commands: "dnf install --assumeyes @development-tools gcc gcc-c++ cmake git openssl-devel perl-core" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ matrix.os.image }}
+
+      - name: Dependencies
+        run: ${{ matrix.os.commands }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Download monerod
+        uses: ./.github/actions/monerod-download
+
+      - name: Documentation
+        run: ${{ env.CMD_DOC }}
+
+      - name: Clippy (fail on warnings)
+        run: ${{ env.CMD_CLIPPY }}
+
+      - name: Test
+        run: ${{ env.CMD_TEST }}
+
+      - name: Build
+        run: ${{ env.CMD_BUILD }}
+
+      - name: Hack Check
+        run: ${{ env.CMD_HACK }}

@@ -1,0 +1,47 @@
+[package]
+name        = "cuprate-rpc-types"
+version     = "0.0.0"
+edition     = "2021"
+description = "Monero RPC types"
+license     = "MIT"
+authors     = ["hinto-janai"]
+repository  = "https://github.com/Cuprate/cuprate/tree/main/rpc/types"
+keywords    = ["cuprate", "rpc", "types", "monero"]
+
+[features]
+default = ["serde", "epee"]
+serde   = ["dep:serde", "cuprate-fixed-bytes/serde", "cuprate-types/serde"]
+epee    = ["dep:cuprate-epee-encoding", "cuprate-types/epee"]
+from    = [
+	"dep:cuprate-helper",
+	"cuprate-helper/map",
+	"cuprate-helper/fmt",
+	"dep:cuprate-p2p-core",
+	"dep:hex"
+]
+__not_public_32_bit = ["getrandom"]
+
+[dependencies]
+cuprate-fixed-bytes   = { workspace = true }
+cuprate-hex           = { workspace = true }
+cuprate-epee-encoding = { workspace = true, optional = true }
+cuprate-types         = { workspace = true, default-features = false, features = ["rpc", "json"] }
+cuprate-helper        = { workspace = true, optional = true, default-features = false }
+cuprate-p2p-core      = { workspace = true, optional = true, default-features = false }
+
+paste = { workspace = true }
+serde = { workspace = true, optional = true }
+hex   = { workspace = true, optional = true }
+
+getrandom = { version = "0.2", optional = true, features = ["js"] }
+
+[dev-dependencies]
+cuprate-test-utils = { workspace = true }
+
+hex-literal       = { workspace = true }
+pretty_assertions = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+
+[lints]
+workspace = true
