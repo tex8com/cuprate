@@ -9,6 +9,32 @@ _(work-in-progress)_
 
 </div>
 
+## Monero Fast Node quick start
+
+Build MFN locally from the repository root:
+
+```bash
+cargo build -p cuprated --release --locked --manifest-path node/mfn-monero-fast-node/Cargo.toml
+node/mfn-monero-fast-node/target/release/cuprated --help
+```
+
+Run it with a local configuration file:
+
+```bash
+node/mfn-monero-fast-node/target/release/cuprated \
+  --config-file /absolute/path/to/cuprated.toml \
+  --skip-config-warning
+```
+
+For a production release: make the change locally, test it, commit and push;
+then the server pulls that commit, builds it and deploys the binary. Never edit
+MFN source code on a server.
+
+**Current production gate:** the checked-in MFN source does not yet include the
+`rpc.wallet_scan_cache` configuration extension required by the deployed Fast
+Wallet configuration. Do not deploy this Node binary to production until that
+fork functionality is restored and an integration build passes.
+
 ## TEX8 Fork — Wallet Sync Optimizations (`fast-rpc` branch)
 
 **Author:** Roland Kohlhuber  
