@@ -138,20 +138,25 @@ async fn get_transactions(
         ));
     }
 
-    let (txs_in_blockchain, missed_txs) = {
+    let (txs_in_blockchain, mut missed_txs) = {
         let requested_txs = request.txs_hashes.into_iter().map(|tx| tx.0).collect();
         blockchain::transactions(&mut state.blockchain_read, requested_txs).await?
     };
-
-    let missed_tx = missed_txs.clone().into_iter().map(Hex).collect();
 
     // Check the txpool for missed transactions.
     let txs_in_pool = if missed_txs.is_empty() {
         vec![]
     } else {
         let include_sensitive_txs = !state.is_restricted();
-        txpool::txs_by_hash(&mut state.txpool_read, missed_txs, include_sensitive_txs).await?
+        txpool::txs_by_hash(
+            &mut state.txpool_read,
+            missed_txs.clone(),
+            include_sensitive_txs,
+        )
+        .await?
     };
+    remove_found_pool_transactions(&mut missed_txs, &txs_in_pool);
+    let missed_tx = missed_txs.into_iter().map(Hex).collect();
 
     let (txs, txs_as_hex, txs_as_json) = {
         // Prepare the final JSON output.
@@ -272,6 +277,17 @@ async fn get_transactions(
         missed_tx,
         txs,
     })
+}
+
+/// The blockchain reader reports every non-mined hash as missed before the
+/// txpool is queried. Monero's RPC contract reserves `missed_tx` for hashes
+/// absent from both stores, so remove pool hits before building the response.
+fn remove_found_pool_transactions(missed_txs: &mut Vec<[u8; 32]>, txs_in_pool: &[TxInPool]) {
+    let found_in_pool = txs_in_pool
+        .iter()
+        .map(|tx| tx.tx_hash)
+        .collect::<HashSet<_>>();
+    missed_txs.retain(|hash| !found_in_pool.contains(hash));
 }
 
 /// Cuprate's JSON conversion for non-coinbase RingCT transactions still
@@ -844,7 +860,9 @@ async fn set_log_hash_rate(
 
 #[cfg(test)]
 mod tests {
-    use super::reject_unsupported_transaction_json;
+    use cuprate_types::TxInPool;
+
+    use super::{reject_unsupported_transaction_json, remove_found_pool_transactions};
 
     #[test]
     fn transaction_json_request_fails_closed_without_panicking() {
@@ -853,5 +871,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("decode_as_json is temporarily unsupported"));
+    }
+
+    #[test]
+    fn pool_hits_are_not_reported_as_missed_transactions() {
+        let pool_hash = [0x11; 32];
+        let absent_hash = [0x22; 32];
+        let mut missed = vec![pool_hash, absent_hash];
+        let pool = vec![TxInPool {
+            tx_blob: vec![1, 2, 3],
+            tx_hash: pool_hash,
+            double_spend_seen: false,
+            received_timestamp: 1,
+            relayed: true,
+        }];
+
+        remove_found_pool_transactions(&mut missed, &pool);
+
+        assert_eq!(missed, vec![absent_hash]);
     }
 }
