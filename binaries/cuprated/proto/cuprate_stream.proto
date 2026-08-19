@@ -40,6 +40,12 @@ service BlockStream {
   // end-of-stream.
   rpc StreamBlocks(StreamBlocksRequest) returns (stream BlockChunk);
 
+  // Capability-safe persistent striped transport. Each lane remains open for
+  // the complete finite range and serves only its assigned fixed-size stripes.
+  // Older servers return UNIMPLEMENTED for this distinct method, allowing
+  // clients to fall back to StreamBlocks without guessing field support.
+  rpc StreamBlockLane(StreamBlocksRequest) returns (stream BlockChunk);
+
   // Resolve a public blockchain-anchored MFW name. The server only returns
   // derived, owner-signed public data. Clients MUST reject every status except
   // MFW_NAME_STATUS_FINALIZED before preparing a payment.
@@ -116,6 +122,12 @@ message StreamBlocksRequest {
   // 32 bytes. When supplied, the server finds the first common block and
   // streams from that height, matching getblocks.bin reorg semantics.
   repeated bytes chain_locator = 7;
+
+  // StreamBlockLane only: lane i serves fixed stripes i, i+lane_count, ... .
+  // StreamBlocks ignores these fields.
+  uint32 stripe_span_blocks = 8;
+  uint32 lane_index = 9;
+  uint32 lane_count = 10;
 }
 
 message BlockChunk {
