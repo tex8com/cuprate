@@ -6,7 +6,10 @@
 #![allow(clippy::await_holding_lock, clippy::too_many_lines)]
 
 //---------------------------------------------------------------------------------------------------- Use
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use indexmap::{IndexMap, IndexSet};
 use pretty_assertions::assert_eq;
@@ -409,6 +412,42 @@ async fn rct_output_distribution() {
     };
     assert_eq!(distributions[0].base, 7);
     assert_eq!(distributions[0].distribution, vec![8]);
+}
+
+#[tokio::test]
+async fn transactions_return_chain_data_and_pool_misses_without_panicking() {
+    let (reader, mut writer, _env, _tempdir) = init_service();
+    let mut block = BLOCK_V9_TX3.clone();
+    block.height = 0;
+    let known_tx = block.txs[0].clone();
+    let block_timestamp = block.block.header.timestamp;
+
+    let response = writer
+        .call(BlockchainWriteRequest::WriteBlock(block))
+        .await
+        .unwrap();
+    assert_eq!(response, BlockchainResponse::Ok);
+
+    let missing_hash = [0x5a; 32];
+    let response = reader
+        .oneshot(BlockchainReadRequest::Transactions {
+            tx_hashes: HashSet::from([known_tx.tx_hash, missing_hash]),
+        })
+        .await
+        .unwrap();
+    let BlockchainResponse::Transactions { txs, missed_txs } = response else {
+        panic!("wrong response type");
+    };
+
+    assert_eq!(missed_txs, vec![missing_hash]);
+    assert_eq!(txs.len(), 1);
+    let returned = &txs[0];
+    assert_eq!(returned.tx_hash, known_tx.tx_hash);
+    assert_eq!(returned.tx_blob, known_tx.tx_blob);
+    assert_eq!(returned.block_height, 0);
+    assert_eq!(returned.block_timestamp, block_timestamp);
+    assert_eq!(returned.confirmations, 1);
+    assert!(!returned.pruned_blob.is_empty());
 }
 
 /// Assert write/read correctness of [`block_v1_tx2`].

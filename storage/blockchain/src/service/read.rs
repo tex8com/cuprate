@@ -25,6 +25,8 @@ use rayon::{
 };
 use thread_local::ThreadLocal;
 
+use monero_oxide::{primitives::keccak256, transaction::Transaction};
+
 use cuprate_database::{ConcreteEnv, DatabaseRo, DbResult, Env, EnvInner, RuntimeError};
 use cuprate_database_service::{init_thread_pool, DatabaseReadService, ReaderThreads};
 use cuprate_helper::map::combine_low_high_bits_to_u128;
@@ -32,7 +34,7 @@ use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
     output_cache::OutputCache,
     rpc::{OutputDistributionData, OutputHistogramInput},
-    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, TxsInBlock,
+    Chain, ChainId, ExtendedBlockHeader, OutputDistributionInput, TxInBlockchain, TxsInBlock,
 };
 
 use crate::{
@@ -976,10 +978,82 @@ fn alt_chain_count(env: &ConcreteEnv) -> ResponseResult {
 
 /// [`BlockchainReadRequest::Transactions`]
 fn transactions(env: &ConcreteEnv, tx_hashes: HashSet<[u8; 32]>) -> ResponseResult {
-    Ok(BlockchainResponse::Transactions {
-        txs: todo!(),
-        missed_txs: todo!(),
-    })
+    // This request is exposed by `/gettransactions`. In particular, Monero's
+    // wallet mempool flow first asks for the pool hashes and then uses this
+    // request to distinguish mined transactions from transactions that must
+    // be read from the txpool. Never leave a public RPC path backed by a
+    // `todo!()`: a single valid wallet request would abort the entire node.
+    let env_inner = env.env_inner();
+    let tx_ro = env_inner.tx_ro()?;
+    let tables = env_inner.open_tables(&tx_ro)?;
+    let chain_height = crate::ops::blockchain::chain_height(tables.block_heights())?;
+
+    let mut txs = Vec::with_capacity(tx_hashes.len());
+    let mut missed_txs = Vec::new();
+    let mut block_timestamps = HashMap::new();
+
+    for tx_hash in tx_hashes {
+        if !tables.tx_ids().contains(&tx_hash)? {
+            missed_txs.push(tx_hash);
+            continue;
+        }
+
+        let tx_id = tables.tx_ids().get(&tx_hash)?;
+        let tx_blob = tables.tx_blobs().get(&tx_id)?.0;
+        let block_height = tables.tx_heights().get(&tx_id)?;
+        let block_timestamp = if let Some(timestamp) = block_timestamps.get(&block_height) {
+            *timestamp
+        } else {
+            let timestamp = tables.block_infos().get(&block_height)?.timestamp;
+            block_timestamps.insert(block_height, timestamp);
+            timestamp
+        };
+        let output_indices = tables.tx_outputs().get(&tx_id)?.0;
+
+        let tx = Transaction::read(&mut tx_blob.as_slice()).map_err(|_| {
+            RuntimeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to parse transaction blob",
+            ))
+        })?;
+        let (pruned_blob, prunable_blob, prunable_hash) = if tx.version() == 1 {
+            (tx_blob.clone(), Vec::new(), [0; 32])
+        } else {
+            let (pruned_tx, prunable_blob) = tx.pruned_with_prunable();
+            if prunable_blob.is_empty() {
+                (tx_blob.clone(), Vec::new(), [0; 32])
+            } else {
+                let prunable_hash = keccak256(&prunable_blob);
+                (pruned_tx.serialize(), prunable_blob, prunable_hash)
+            }
+        };
+
+        txs.push(TxInBlockchain {
+            block_height: u64::try_from(block_height).map_err(|_| {
+                RuntimeError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transaction height does not fit into u64",
+                ))
+            })?,
+            block_timestamp,
+            confirmations: u64::try_from(chain_height.saturating_sub(block_height)).map_err(
+                |_| {
+                    RuntimeError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "transaction confirmation count does not fit into u64",
+                    ))
+                },
+            )?,
+            output_indices,
+            tx_hash,
+            tx_blob,
+            pruned_blob,
+            prunable_blob,
+            prunable_hash,
+        });
+    }
+
+    Ok(BlockchainResponse::Transactions { txs, missed_txs })
 }
 
 /// [`BlockchainReadRequest::TotalRctOutputs`]
