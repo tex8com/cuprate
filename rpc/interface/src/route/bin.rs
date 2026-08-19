@@ -5,6 +5,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower::ServiceExt;
@@ -17,6 +18,7 @@ use cuprate_rpc_types::{
     bin::{
         BinRequest, BinResponse, GetBlocksByHeightRequest, GetBlocksRequest, GetHashesRequest,
         GetOutputIndexesRequest, GetOutsRequest, GetTransactionPoolHashesRequest,
+        GetTransactionPoolHashesResponse,
     },
     json::GetOutputDistributionRequest,
     RpcCall,
@@ -100,23 +102,6 @@ macro_rules! generate_endpoints_with_input {
     }};
 }
 
-/// This macro generates route functions that expect _no_ input.
-macro_rules! generate_endpoints_with_no_input {
-    ($(
-        $endpoint:ident => $variant:ident
-    ),*) => { paste::paste! {
-        $(
-            pub(crate) async fn $endpoint<H: RpcHandler>(
-                State(handler): State<H>,
-                headers: HeaderMap,
-            ) -> Result<axum::response::Response, StatusCode> {
-                const REQUEST: BinRequest = BinRequest::$variant([<$variant Request>] {});
-                generate_endpoints_inner!($variant, handler, headers, REQUEST)
-            }
-        )*
-    }};
-}
-
 /// De-duplicated inner function body.
 macro_rules! generate_endpoints_inner {
     ($variant:ident, $handler:ident, $headers:ident, $request:expr_2021) => {
@@ -162,12 +147,131 @@ generate_endpoints_with_input! {
     get_output_distribution => GetOutputDistribution
 }
 
-generate_endpoints_with_no_input! {
-    get_transaction_pool_hashes => GetTransactionPoolHashes
+/// Serve Monero's legacy pool-hash endpoint.
+///
+/// Despite its `.bin` suffix, upstream `monerod` maps this route through its
+/// JSON serializer. The `tx_hashes` field is one JSON string containing the
+/// raw concatenated 32-byte hashes, escaped with epee's byte-oriented rules.
+/// Wallet Core therefore calls this endpoint through `invoke_http_json`.
+pub(crate) async fn get_transaction_pool_hashes<H: RpcHandler>(
+    State(handler): State<H>,
+) -> Result<axum::response::Response, StatusCode> {
+    eprintln!(
+        "[MFN RPC] route=/get_transaction_pool_hashes.bin stage=request_received encoding=json"
+    );
+
+    const REQUEST: BinRequest =
+        BinRequest::GetTransactionPoolHashes(GetTransactionPoolHashesRequest {});
+    let response = handler.oneshot(REQUEST).await.map_err(|error| {
+        eprintln!(
+            "[MFN RPC] route=/get_transaction_pool_hashes.bin stage=handler_failed error={error:?}"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let BinResponse::GetTransactionPoolHashes(response) = response else {
+        panic!("RPC handler returned incorrect response");
+    };
+    let hash_count = response.tx_hashes.len();
+    let body = transaction_pool_hashes_json_body(response);
+
+    eprintln!(
+        "[MFN RPC] route=/get_transaction_pool_hashes.bin stage=response_encoded encoding=json hash_count={} response_bytes={}",
+        hash_count,
+        body.len()
+    );
+
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+fn transaction_pool_hashes_json_body(response: GetTransactionPoolHashesResponse) -> Bytes {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        br#"{"credits":0,"top_hash":"","status":"OK","untrusted":false,"tx_hashes":"#,
+    );
+    push_epee_json_string(&mut body, response.tx_hashes.take_bytes().as_ref());
+    body.push(b'}');
+    Bytes::from(body)
+}
+
+/// Match epee's `transform_to_escape_sequence` exactly. In particular, bytes
+/// outside ASCII are retained verbatim because Monero's parser treats this as
+/// a byte string rather than a Unicode JSON string.
+fn push_epee_json_string(json: &mut Vec<u8>, bytes: &[u8]) {
+    json.push(b'"');
+
+    for byte in bytes {
+        match *byte {
+            b'\x08' => json.extend_from_slice(br"\b"),
+            b'\x0c' => json.extend_from_slice(br"\f"),
+            b'\n' => json.extend_from_slice(br"\n"),
+            b'\r' => json.extend_from_slice(br"\r"),
+            b'\t' => json.extend_from_slice(br"\t"),
+            b'\x0b' => json.extend_from_slice(br"\v"),
+            b'"' => json.extend_from_slice(br#"\""#),
+            b'\\' => json.extend_from_slice(br"\\"),
+            b'/' => json.extend_from_slice(br"\/"),
+            byte => json.push(byte),
+        }
+    }
+
+    json.push(b'"');
 }
 
 //---------------------------------------------------------------------------------------------------- Tests
 #[cfg(test)]
 mod test {
-    // use super::*;
+    use super::*;
+    use crate::RpcHandlerDummy;
+
+    #[tokio::test]
+    async fn pool_hashes_route_is_json_end_to_end() {
+        let response = get_transaction_pool_hashes(State(RpcHandlerDummy { restricted: false }))
+            .await
+            .expect("pool hashes route must succeed");
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body must be readable");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"credits":0,"top_hash":"","status":"OK","untrusted":false,"tx_hashes":""}"#
+        );
+    }
+
+    #[test]
+    fn pool_hashes_route_uses_upstream_json_envelope() {
+        let body = transaction_pool_hashes_json_body(GetTransactionPoolHashesResponse::default());
+
+        assert_eq!(
+            body.as_ref(),
+            br#"{"credits":0,"top_hash":"","status":"OK","untrusted":false,"tx_hashes":""}"#
+        );
+    }
+
+    #[test]
+    fn pool_hashes_route_matches_epee_byte_escaping() {
+        let mut hash = [0x41; 32];
+        hash[..10].copy_from_slice(&[
+            b'\x08', b'\x0c', b'\n', b'\r', b'\t', b'\x0b', b'"', b'\\', b'/', 0xff,
+        ]);
+        let response = GetTransactionPoolHashesResponse {
+            tx_hashes: hash.into(),
+            ..Default::default()
+        };
+
+        let body = transaction_pool_hashes_json_body(response);
+        assert!(body.windows(19).any(|window| {
+            window
+                == [
+                    b'\\', b'b', b'\\', b'f', b'\\', b'n', b'\\', b'r', b'\\', b't', b'\\', b'v',
+                    b'\\', b'"', b'\\', b'\\', b'\\', b'/', 0xff,
+                ]
+        }));
+        assert_eq!(body.last(), Some(&b'}'));
+    }
 }
