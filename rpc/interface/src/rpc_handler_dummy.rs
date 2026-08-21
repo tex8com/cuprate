@@ -86,6 +86,7 @@ impl Service<JsonRpcRequest> for RpcHandlerDummy {
             Req::GetTransactionPoolBacklog(_) => {
                 Resp::GetTransactionPoolBacklog(Default::default())
             }
+            Req::GetOutputDistribution(_) => Resp::GetOutputDistribution(Default::default()),
             Req::GetMinerData(_) => Resp::GetMinerData(Default::default()),
             Req::PruneBlockchain(_) => Resp::PruneBlockchain(Default::default()),
             Req::CalcPow(_) => Resp::CalcPow(Default::default()),
