@@ -24,7 +24,7 @@ use crate::{
 };
 
 #[cfg(any(feature = "epee", feature = "serde"))]
-use crate::defaults::default;
+use crate::defaults::{default, default_true};
 
 //---------------------------------------------------------------------------------------------------- Definitions
 define_request_and_response! {
@@ -93,7 +93,7 @@ define_request_and_response! {
     GetOuts,
     Request {
         outputs: Vec<GetOutputsOut> = default::<Vec<GetOutputsOut>>(), "default",
-        get_txid: bool,
+        get_txid: bool = default_true(), "default_true",
     },
     AccessResponseBase {
         outs: Vec<OutKeyBin> = default::<Vec<OutKeyBin>>(), "default",
@@ -210,5 +210,29 @@ pub enum BinResponse {
 //---------------------------------------------------------------------------------------------------- Tests
 #[cfg(test)]
 mod test {
-    // use super::*;
+    use super::*;
+
+    #[cfg(feature = "epee")]
+    struct GetOutsWithoutTxid {
+        outputs: Vec<GetOutputsOut>,
+    }
+
+    #[cfg(feature = "epee")]
+    cuprate_epee_encoding::epee_object! {
+        GetOutsWithoutTxid,
+        outputs: Vec<GetOutputsOut>,
+    }
+
+    #[cfg(feature = "epee")]
+    #[test]
+    fn get_outs_request_defaults_missing_txid_to_true() {
+        let encoded = cuprate_epee_encoding::to_bytes(GetOutsWithoutTxid {
+            outputs: Vec::new(),
+        })
+        .unwrap();
+        let request: GetOutsRequest =
+            cuprate_epee_encoding::from_bytes(&mut encoded.as_ref()).unwrap();
+
+        assert!(request.get_txid);
+    }
 }
