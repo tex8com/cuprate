@@ -58,39 +58,44 @@ fn decompress_integer_array(bytes: &[u8]) -> Vec<u64> {
 
 #[cfg(any(feature = "epee", feature = "serde"))]
 fn write_monero_varint(value: u64, bytes: &mut Vec<u8>) {
-    const SIZE_OF_SIZE_MARKER: u32 = 2;
-    const FITS_IN_ONE_BYTE: u64 = 2_u64.pow(8 - SIZE_OF_SIZE_MARKER) - 1;
-    const FITS_IN_TWO_BYTES: u64 = 2_u64.pow(16 - SIZE_OF_SIZE_MARKER) - 1;
-    const FITS_IN_FOUR_BYTES: u64 = 2_u64.pow(32 - SIZE_OF_SIZE_MARKER) - 1;
+    let mut value = value;
 
-    let size_marker = match value {
-        0..=FITS_IN_ONE_BYTE => 0,
-        64..=FITS_IN_TWO_BYTES => 1,
-        16_384..=FITS_IN_FOUR_BYTES => 2,
-        _ => 3,
-    };
+    while value >= 0x80 {
+        bytes.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
 
-    let tagged = (value << SIZE_OF_SIZE_MARKER) | size_marker;
-    bytes.extend_from_slice(&tagged.to_le_bytes()[..1 << size_marker]);
+    bytes.push(value as u8);
 }
 
 #[cfg(any(feature = "epee", feature = "serde"))]
 fn read_monero_varint(bytes: &mut &[u8]) -> Option<u64> {
-    let first = *bytes.first()?;
-    let len = 1usize << (first & 0b11);
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
 
-    if bytes.len() < len {
-        return None;
+    loop {
+        let byte = *bytes.first()?;
+        *bytes = &bytes[1..];
+
+        if shift + 7 >= u64::BITS {
+            let limit = 1_u8 << (u64::BITS - shift);
+            if byte >= limit {
+                return None;
+            }
+        }
+
+        if byte == 0 && shift != 0 {
+            return None;
+        }
+
+        value |= u64::from(byte & 0x7f) << shift;
+
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+
+        shift += 7;
     }
-
-    let mut value = u64::from(first >> 2);
-
-    for (index, byte) in bytes[1..len].iter().enumerate() {
-        value |= u64::from(*byte) << ((index * 8) + 6);
-    }
-
-    *bytes = &bytes[len..];
-    Some(value)
 }
 
 //---------------------------------------------------------------------------------------------------- Distribution
@@ -349,14 +354,14 @@ mod tests {
         let varints = &[16_384, 16_383, 16_382, 16_381];
         let bytes = compress_integer_array(varints);
 
-        let expected = vec![2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
+        let expected = vec![128, 128, 1, 255, 127, 254, 127, 253, 127];
         assert_eq!(expected, bytes);
     }
 
     /// Tests that [`decompress_integer_array`] outputs as expected.
     #[test]
     fn decompress() {
-        let bytes = &[2, 0, 1, 0, 253, 255, 249, 255, 245, 255];
+        let bytes = &[128, 128, 1, 255, 127, 254, 127, 253, 127];
         let varints = decompress_integer_array(bytes);
 
         let expected = vec![16_384, 16_383, 16_382, 16_381];
