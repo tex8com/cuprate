@@ -16,7 +16,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use mfw_recipient_protocol::{Network as MfwNetwork, Resolution, ResolutionStatus};
+use mfw_recipient_protocol::{
+    AddressKind as MfwAddressKind, Network as MfwNetwork, PublicAddress as MfwPublicAddress,
+    Resolution, ResolutionStatus,
+};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
@@ -310,6 +313,10 @@ async fn run_rpc_server(
     let resolver_router = Router::new()
         .route("/v1/mfw/names/{name}", get(resolve_mfw_name_http))
         .route(
+            "/v1/mfw/addresses/{address}/names",
+            get(reverse_mfw_names_http),
+        )
+        .route(
             "/v1/mfw/name-suggestions/{prefix}",
             get(suggest_mfw_names_http),
         )
@@ -361,6 +368,104 @@ struct MfwNameHttpResponse {
 struct MfwNameSuggestionsHttpResponse {
     prefix: String,
     names: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MfwReverseNamesHttpResponse {
+    address: String,
+    network: &'static str,
+    names: Vec<String>,
+    truncated: bool,
+    chain_tip_height: u64,
+    chain_tip_hash_hex: String,
+}
+
+async fn reverse_mfw_names_http(
+    State(index): State<Option<SharedNameIndex>>,
+    Path(address): Path<String>,
+) -> Result<Response, (StatusCode, &'static str)> {
+    let index = index.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "MFW name index is disabled",
+    ))?;
+    if !index.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MFW name index is restoring or catching up",
+        ));
+    }
+    let guard = index.read().await;
+    if !index.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MFW name index changed while reverse resolving",
+        ));
+    }
+    let network = guard.parameters().network;
+    let (canonical_address, public_address) = parse_mfw_reverse_address(network, &address)?;
+    let (names, truncated) = guard
+        .reverse_names(public_address, 100)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "MFW reverse query is invalid"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok((
+        headers,
+        Json(MfwReverseNamesHttpResponse {
+            address: canonical_address,
+            network: mfw_network_name(network),
+            names,
+            truncated,
+            chain_tip_height: guard.tip_height().unwrap_or(0),
+            chain_tip_hash_hex: guard.tip_hash().map_or_else(String::new, hex::encode),
+        }),
+    )
+        .into_response())
+}
+
+fn parse_mfw_reverse_address(
+    network: MfwNetwork,
+    input: &str,
+) -> Result<(String, MfwPublicAddress), (StatusCode, &'static str)> {
+    let address = monero_address::MoneroAddress::from_str(monero_network(network), input.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Monero address is invalid"))?;
+    let kind = match address.kind() {
+        monero_address::AddressType::Legacy => MfwAddressKind::Standard,
+        monero_address::AddressType::Subaddress => MfwAddressKind::Subaddress,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Integrated and featured addresses cannot own MFW names",
+            ));
+        }
+    };
+    let public_address = MfwPublicAddress::new(
+        kind,
+        address.spend().compress().to_bytes(),
+        address.view().compress().to_bytes(),
+    )
+    .map_err(|_| (StatusCode::BAD_REQUEST, "Monero address is invalid"))?;
+    Ok((address.to_string(), public_address))
+}
+
+fn monero_network(network: MfwNetwork) -> monero_address::Network {
+    match network {
+        MfwNetwork::Mainnet => monero_address::Network::Mainnet,
+        MfwNetwork::Testnet => monero_address::Network::Testnet,
+        MfwNetwork::Stagenet => monero_address::Network::Stagenet,
+    }
+}
+
+fn mfw_network_name(network: MfwNetwork) -> &'static str {
+    match network {
+        MfwNetwork::Mainnet => "mainnet",
+        MfwNetwork::Testnet => "testnet",
+        MfwNetwork::Stagenet => "stagenet",
+    }
 }
 
 async fn suggest_mfw_names_http(
@@ -622,5 +727,16 @@ mod mfw_http_tests {
         assert_eq!(value["recordPayloadHex"], "");
         assert_eq!(value["recordHeight"], 0);
         assert_eq!(value["chainTipHeight"], 500);
+    }
+
+    #[test]
+    fn reverse_lookup_accepts_only_canonical_network_addresses() {
+        let registry_address = "49indexNameRuJZKgFL42yi11NgwYn3pzgf45HvvbEpCZq29KfQknnUM6xaptUokNsjh8TRghjr94ioSN2ZNhePm1vzJLQJ";
+        let (canonical, parsed) =
+            parse_mfw_reverse_address(MfwNetwork::Mainnet, registry_address).unwrap();
+        assert_eq!(canonical, registry_address);
+        assert_eq!(parsed.kind, MfwAddressKind::Standard);
+        assert!(parse_mfw_reverse_address(MfwNetwork::Testnet, registry_address).is_err());
+        assert!(parse_mfw_reverse_address(MfwNetwork::Mainnet, "not-an-address").is_err());
     }
 }
