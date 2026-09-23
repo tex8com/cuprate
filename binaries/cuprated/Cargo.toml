@@ -100,8 +100,8 @@ tracing               = { workspace = true, features = ["default"] }
 ed25519-dalek         = { version = "2" }
 fs2                   = { version = "0.4" }
 libc                  = { version = "0.2" }
-scanpack-format       = { path = "../../../../native/scanpack-format" }
-mfw-recipient-protocol = { path = "../../../../native/mfw-recipient-protocol" }
+scanpack-format       = { path = "../../external/scanpack-format" }
+mfw-recipient-protocol = { path = "../../external/mfw-recipient-protocol" }
 zeroize               = { version = "1" }
 
 [dev-dependencies]
