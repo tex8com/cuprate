@@ -473,25 +473,18 @@ pub fn get_wallet_scan_range(
                         RuntimeError::Io(std::io::Error::other("failed to parse tx"))
                     })?;
 
-                    if tx.version() == 1 {
-                        Ok(PrunedTxBlobEntry {
-                            blob: Bytes::from(tx_blob.clone()),
-                            prunable_hash: ByteArray::from([0u8; 32]),
-                        })
+                    let version = tx.version();
+                    let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
+                    let prunable_hash = if version == 1 || prunable_bytes.is_empty() {
+                        [0u8; 32]
                     } else {
-                        let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
-                        if prunable_bytes.is_empty() {
-                            Ok(PrunedTxBlobEntry {
-                                blob: Bytes::from(tx_blob.clone()),
-                                prunable_hash: ByteArray::from([0u8; 32]),
-                            })
-                        } else {
-                            Ok(PrunedTxBlobEntry {
-                                blob: Bytes::from(pruned_tx.serialize()),
-                                prunable_hash: ByteArray::from(keccak256(&prunable_bytes)),
-                            })
-                        }
-                    }
+                        keccak256(&prunable_bytes)
+                    };
+
+                    Ok(PrunedTxBlobEntry {
+                        blob: Bytes::from(pruned_tx.serialize()),
+                        prunable_hash: ByteArray::from(prunable_hash),
+                    })
                 })
                 .collect::<Result<_, RuntimeError>>()?;
             TransactionBlobs::Pruned(pruned_entries)
@@ -537,25 +530,23 @@ pub fn get_block_complete_entry_from_height_pruned(
             let tx = Transaction::read(&mut tx_blob.as_slice())
                 .map_err(|_| RuntimeError::Io(std::io::Error::other("failed to parse tx")))?;
 
-            if tx.version() == 1 {
-                Ok(PrunedTxBlobEntry {
-                    blob: Bytes::from(tx_blob),
-                    prunable_hash: ByteArray::from([0u8; 32]),
-                })
+            let version = tx.version();
+            let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
+
+            // Monero's pruned representation of a v1 transaction omits its ring
+            // signatures, but the wire-format prunable hash remains zero. Returning
+            // the original full blob here makes a pruned decoder stop at the prefix
+            // and incorrectly observe the signatures as trailing bytes.
+            let prunable_hash = if version == 1 || prunable_bytes.is_empty() {
+                [0u8; 32]
             } else {
-                let (pruned_tx, prunable_bytes) = tx.pruned_with_prunable();
-                if prunable_bytes.is_empty() {
-                    Ok(PrunedTxBlobEntry {
-                        blob: Bytes::from(tx_blob),
-                        prunable_hash: ByteArray::from([0u8; 32]),
-                    })
-                } else {
-                    Ok(PrunedTxBlobEntry {
-                        blob: Bytes::from(pruned_tx.serialize()),
-                        prunable_hash: ByteArray::from(keccak256(&prunable_bytes)),
-                    })
-                }
-            }
+                keccak256(&prunable_bytes)
+            };
+
+            Ok(PrunedTxBlobEntry {
+                blob: Bytes::from(pruned_tx.serialize()),
+                prunable_hash: ByteArray::from(prunable_hash),
+            })
         })
         .collect::<Result<_, RuntimeError>>()?;
 
@@ -690,6 +681,7 @@ pub fn block_exists(
 #[cfg(test)]
 #[expect(clippy::too_many_lines)]
 mod test {
+    use monero_oxide::transaction::Pruned;
     use pretty_assertions::assert_eq;
 
     use cuprate_database::{Env, EnvInner, TxRw};
@@ -703,6 +695,55 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn pruned_block_entries_are_canonical_for_v1_and_v2() {
+        let (env, _tmp) = tmp_concrete_env();
+        let env_inner = env.env_inner();
+        let mut blocks = [BLOCK_V1_TX2.clone(), BLOCK_V9_TX3.clone()];
+        for (height, block) in blocks.iter_mut().enumerate() {
+            block.height = height;
+        }
+
+        {
+            let tx_rw = env_inner.tx_rw().unwrap();
+            let mut tables = env_inner.open_tables_mut(&tx_rw).unwrap();
+            for block in &blocks {
+                add_block(block, &mut tables).unwrap();
+            }
+            drop(tables);
+            TxRw::commit(tx_rw).unwrap();
+        }
+
+        let tx_ro = env_inner.tx_ro().unwrap();
+        let tables = env_inner.open_tables(&tx_ro).unwrap();
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        for (height, block) in blocks.iter().enumerate() {
+            let entry = get_block_complete_entry_from_height_pruned(&height, &tables).unwrap();
+            let TransactionBlobs::Pruned(entries) = entry.txs else {
+                panic!("expected pruned transaction entries");
+            };
+            assert_eq!(entries.len(), block.txs.len());
+
+            for (entry, original) in entries.iter().zip(&block.txs) {
+                let mut remaining = entry.blob.as_ref();
+                let parsed = Transaction::<Pruned>::read(&mut remaining).unwrap();
+                assert!(remaining.is_empty());
+                assert_eq!(parsed.version(), original.tx.version());
+
+                if original.tx.version() == 1 {
+                    saw_v1 = true;
+                    assert!(entry.blob.len() < original.tx_blob.len());
+                    assert_eq!(entry.prunable_hash, ByteArray::from([0u8; 32]));
+                } else {
+                    saw_v2 = true;
+                }
+            }
+        }
+        assert!(saw_v1);
+        assert!(saw_v2);
+    }
 
     /// Tests all above block functions.
     ///
